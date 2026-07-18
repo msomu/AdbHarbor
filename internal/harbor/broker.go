@@ -1,0 +1,591 @@
+package harbor
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"sync"
+	"syscall"
+	"time"
+)
+
+const (
+	reaperInterval = 2 * time.Second
+	// orphanBeat: a lease with running commands but no heartbeat for this
+	// long is treated as orphaned (shim killed hard) and moved to idle.
+	orphanBeat = 60 * time.Second
+	// staleWaiter: queued waiters that stopped polling are dropped.
+	staleWaiter = 90 * time.Second
+	// unclaimedGrace: a lease granted from the queue whose client never
+	// picks it up (killed while waiting) is reclaimed after this long.
+	unclaimedGrace = 20 * time.Second
+)
+
+type Lease struct {
+	ID         string    `json:"id"`
+	Serial     string    `json:"serial"`
+	Session    string    `json:"session"`
+	Holder     string    `json:"holder"`
+	PID        int       `json:"pid"`
+	AcquiredAt time.Time `json:"acquired_at"`
+	LastActive time.Time `json:"last_active"`
+	LastBeat   time.Time `json:"last_beat"`
+	Running    int       `json:"running"`
+	IdleTTL    time.Duration `json:"idle_ttl"`
+	Explicit   bool      `json:"explicit"`
+	ExpiresAt  time.Time `json:"expires_at"`
+	// Claimed is false for a lease granted from the queue until its owner
+	// shows a sign of life (wait pickup, heartbeat, or command end).
+	Claimed bool `json:"claimed"`
+}
+
+type Waiter struct {
+	ID       string
+	Serial   string
+	Session  string
+	Holder   string
+	Command  bool
+	IdleTTL  time.Duration
+	Enqueued time.Time
+	LastPoll time.Time
+	ch       chan struct{}
+	lease    *Lease
+}
+
+type Broker struct {
+	mu      sync.Mutex
+	cfg     *Config
+	leases  map[string]*Lease  // by serial
+	queues  map[string][]*Waiter
+	waiters map[string]*Waiter // by waiter ID
+	seq     int64
+}
+
+// RunDaemon starts the broker on the harbor unix socket (foreground).
+func RunDaemon() error {
+	if err := EnsureDir(); err != nil {
+		return err
+	}
+	log.SetPrefix("[harbor] ")
+
+	// Exclusive daemon lock: released automatically if we die.
+	lockF, err := os.OpenFile(LockPath(), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return err
+	}
+	if err := syscall.Flock(int(lockF.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		return errors.New("another daemon is already running")
+	}
+
+	os.Remove(SocketPath())
+	ln, err := net.Listen("unix", SocketPath())
+	if err != nil {
+		return fmt.Errorf("listen: %w", err)
+	}
+	os.WriteFile(PIDPath(), []byte(fmt.Sprintf("%d\n", os.Getpid())), 0o600)
+
+	b := &Broker{
+		cfg:     LoadConfig(),
+		leases:  map[string]*Lease{},
+		queues:  map[string][]*Waiter{},
+		waiters: map[string]*Waiter{},
+	}
+	b.loadState()
+	go b.reaper()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/ping", b.handlePing)
+	mux.HandleFunc("/v1/acquire", b.handleAcquire)
+	mux.HandleFunc("/v1/wait", b.handleWait)
+	mux.HandleFunc("/v1/heartbeat", b.handleHeartbeat)
+	mux.HandleFunc("/v1/end", b.handleEnd)
+	mux.HandleFunc("/v1/release", b.handleRelease)
+	mux.HandleFunc("/v1/state", b.handleState)
+	mux.HandleFunc("/v1/devices", b.handleDevices)
+
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sig
+		b.mu.Lock()
+		b.saveStateLocked()
+		b.mu.Unlock()
+		os.Remove(SocketPath())
+		os.Remove(PIDPath())
+		os.Exit(0)
+	}()
+
+	log.Printf("daemon %s listening on %s (pid %d)", Version, SocketPath(), os.Getpid())
+	return (&http.Server{Handler: mux}).Serve(ln)
+}
+
+func (b *Broker) newID(prefix string) string {
+	b.seq++
+	return fmt.Sprintf("%s-%d-%d", prefix, os.Getpid(), b.seq)
+}
+
+func leaseDesc(l *Lease) string {
+	if l == nil {
+		return "free"
+	}
+	return fmt.Sprintf("%s for %s", l.Holder, time.Since(l.AcquiredAt).Round(time.Second))
+}
+
+// ---- handlers ----
+
+func (b *Broker) handlePing(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, PingResp{OK: true, Version: Version, PID: os.Getpid()})
+}
+
+func (b *Broker) handleAcquire(w http.ResponseWriter, r *http.Request) {
+	var req AcquireReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Serial == "" || req.Session == "" {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	now := time.Now()
+	idle := time.Duration(b.cfg.IdleTTLSec) * time.Second
+	if req.IdleTTLSec > 0 {
+		idle = time.Duration(req.IdleTTLSec) * time.Second
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	l := b.leases[req.Serial]
+	if l != nil && l.Session == req.Session {
+		// Same session: renew the existing lease.
+		l.LastActive, l.LastBeat = now, now
+		l.IdleTTL = idle
+		if req.Command {
+			l.Running++
+		}
+		if req.Explicit {
+			l.Explicit = true
+			l.ExpiresAt = now.Add(b.explicitTTL(req))
+		}
+		writeJSON(w, AcquireResp{Granted: true, LeaseID: l.ID})
+		return
+	}
+	if l == nil {
+		l = b.grantLocked(req, now, idle)
+		writeJSON(w, AcquireResp{Granted: true, LeaseID: l.ID})
+		return
+	}
+	// Busy: enqueue.
+	wt := &Waiter{
+		ID: b.newID("w"), Serial: req.Serial, Session: req.Session,
+		Holder: req.Holder, Command: req.Command, IdleTTL: idle,
+		Enqueued: now, LastPoll: now, ch: make(chan struct{}),
+	}
+	b.queues[req.Serial] = append(b.queues[req.Serial], wt)
+	b.waiters[wt.ID] = wt
+	log.Printf("queued %s for %s (held by %s, %d waiting)", req.Holder, req.Serial, l.Holder, len(b.queues[req.Serial]))
+	writeJSON(w, AcquireResp{
+		WaiterID:   wt.ID,
+		Position:   len(b.queues[req.Serial]),
+		HolderDesc: leaseDesc(l),
+	})
+}
+
+func (b *Broker) explicitTTL(req AcquireReq) time.Duration {
+	if req.TTLSec > 0 {
+		return time.Duration(req.TTLSec) * time.Second
+	}
+	return time.Duration(b.cfg.ExplicitTTLSec) * time.Second
+}
+
+// grantLocked creates a fresh lease for an acquire request.
+func (b *Broker) grantLocked(req AcquireReq, now time.Time, idle time.Duration) *Lease {
+	l := &Lease{
+		ID: b.newID("lease"), Serial: req.Serial, Session: req.Session,
+		Holder: req.Holder, PID: req.PID,
+		AcquiredAt: now, LastActive: now, LastBeat: now,
+		IdleTTL: idle, Explicit: req.Explicit, Claimed: true,
+	}
+	if req.Command {
+		l.Running = 1
+	}
+	if req.Explicit {
+		l.ExpiresAt = now.Add(b.explicitTTL(req))
+	}
+	b.leases[req.Serial] = l
+	b.hist("grant", l, "")
+	log.Printf("granted %s to %s", l.Serial, l.Holder)
+	b.saveStateLocked()
+	return l
+}
+
+func (b *Broker) handleWait(w http.ResponseWriter, r *http.Request) {
+	var req WaitReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	waitFor := time.Duration(req.WaitMS) * time.Millisecond
+	if waitFor <= 0 || waitFor > 25*time.Second {
+		waitFor = 25 * time.Second
+	}
+
+	b.mu.Lock()
+	wt := b.waiters[req.WaiterID]
+	if wt == nil {
+		b.mu.Unlock()
+		writeJSON(w, WaitResp{Expired: true})
+		return
+	}
+	wt.LastPoll = time.Now()
+	if wt.lease != nil {
+		l := wt.lease
+		l.Claimed = true
+		delete(b.waiters, wt.ID)
+		b.mu.Unlock()
+		writeJSON(w, WaitResp{Granted: true, LeaseID: l.ID})
+		return
+	}
+	ch := wt.ch
+	b.mu.Unlock()
+
+	select {
+	case <-ch:
+		b.mu.Lock()
+		l := wt.lease
+		if l != nil {
+			l.Claimed = true
+		}
+		delete(b.waiters, wt.ID)
+		b.mu.Unlock()
+		if l == nil {
+			writeJSON(w, WaitResp{Expired: true})
+			return
+		}
+		writeJSON(w, WaitResp{Granted: true, LeaseID: l.ID})
+	case <-time.After(waitFor):
+		b.mu.Lock()
+		wt.LastPoll = time.Now()
+		pos := b.positionLocked(wt)
+		desc := leaseDesc(b.leases[wt.Serial])
+		b.mu.Unlock()
+		writeJSON(w, WaitResp{Position: pos, HolderDesc: desc})
+	case <-r.Context().Done():
+	}
+}
+
+func (b *Broker) positionLocked(wt *Waiter) int {
+	for i, q := range b.queues[wt.Serial] {
+		if q == wt {
+			return i + 1
+		}
+	}
+	return 0
+}
+
+func (b *Broker) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
+	var req LeaseRef
+	json.NewDecoder(r.Body).Decode(&req)
+	b.mu.Lock()
+	if l := b.leaseByIDLocked(req.LeaseID); l != nil {
+		now := time.Now()
+		l.LastBeat, l.LastActive = now, now
+		l.Claimed = true
+	}
+	b.mu.Unlock()
+	writeJSON(w, map[string]bool{"ok": true})
+}
+
+func (b *Broker) handleEnd(w http.ResponseWriter, r *http.Request) {
+	var req LeaseRef
+	json.NewDecoder(r.Body).Decode(&req)
+	b.mu.Lock()
+	if l := b.leaseByIDLocked(req.LeaseID); l != nil {
+		now := time.Now()
+		if l.Running > 0 {
+			l.Running--
+		}
+		l.LastBeat, l.LastActive = now, now
+		l.Claimed = true
+	}
+	b.mu.Unlock()
+	writeJSON(w, map[string]bool{"ok": true})
+}
+
+func (b *Broker) handleRelease(w http.ResponseWriter, r *http.Request) {
+	var req ReleaseReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	var l *Lease
+	if req.LeaseID != "" {
+		l = b.leaseByIDLocked(req.LeaseID)
+	} else if req.Serial != "" {
+		l = b.leases[req.Serial]
+	}
+	if l == nil {
+		writeJSON(w, ReleaseResp{Released: true, Message: "no active lease"})
+		return
+	}
+	if !req.Force && req.LeaseID == "" && l.Session != req.Session {
+		writeJSON(w, ReleaseResp{Released: false,
+			Message: fmt.Sprintf("device held by %s (session %s); use --force to override", l.Holder, l.Session)})
+		return
+	}
+	reason := "released"
+	if req.Force && l.Session != req.Session {
+		reason = "force-released"
+	}
+	b.expireLocked(l, reason)
+	writeJSON(w, ReleaseResp{Released: true})
+}
+
+func (b *Broker) handleState(w http.ResponseWriter, _ *http.Request) {
+	b.mu.Lock()
+	resp := StateResp{Queues: map[string][]WaiterInfo{}}
+	for _, l := range b.leases {
+		resp.Leases = append(resp.Leases, leaseInfo(l))
+	}
+	for serial, q := range b.queues {
+		for _, wt := range q {
+			resp.Queues[serial] = append(resp.Queues[serial],
+				WaiterInfo{Session: wt.Session, Holder: wt.Holder, Enqueued: wt.Enqueued})
+		}
+	}
+	b.mu.Unlock()
+	writeJSON(w, resp)
+}
+
+func (b *Broker) handleDevices(w http.ResponseWriter, _ *http.Request) {
+	devs, err := ListDevices(b.cfg.RealADB)
+	resp := DevicesResp{}
+	if err != nil {
+		resp.Error = err.Error()
+	}
+	b.mu.Lock()
+	for _, d := range devs {
+		di := DeviceInfo{Serial: d.Serial, State: d.State, Model: d.Model}
+		if l := b.leases[d.Serial]; l != nil {
+			info := leaseInfo(l)
+			di.Lease = &info
+		}
+		di.Waiting = len(b.queues[d.Serial])
+		resp.Devices = append(resp.Devices, di)
+	}
+	// Leases for devices that disappeared still matter.
+	for serial, l := range b.leases {
+		found := false
+		for _, d := range devs {
+			if d.Serial == serial {
+				found = true
+				break
+			}
+		}
+		if !found {
+			info := leaseInfo(l)
+			resp.Devices = append(resp.Devices, DeviceInfo{
+				Serial: serial, State: "disconnected", Lease: &info,
+				Waiting: len(b.queues[serial]),
+			})
+		}
+	}
+	b.mu.Unlock()
+	writeJSON(w, resp)
+}
+
+func leaseInfo(l *Lease) LeaseInfo {
+	info := LeaseInfo{
+		ID: l.ID, Serial: l.Serial, Session: l.Session, Holder: l.Holder,
+		PID: l.PID, AcquiredAt: l.AcquiredAt, LastActive: l.LastActive,
+		Running: l.Running, IdleTTLSec: int(l.IdleTTL.Seconds()), Explicit: l.Explicit,
+	}
+	if l.Explicit {
+		t := l.ExpiresAt
+		info.ExpiresAt = &t
+	}
+	return info
+}
+
+func (b *Broker) leaseByIDLocked(id string) *Lease {
+	for _, l := range b.leases {
+		if l.ID == id {
+			return l
+		}
+	}
+	return nil
+}
+
+// expireLocked removes a lease and hands the device to the next session.
+func (b *Broker) expireLocked(l *Lease, reason string) {
+	delete(b.leases, l.Serial)
+	b.hist(reason, l, fmt.Sprintf("held %s", time.Since(l.AcquiredAt).Round(time.Second)))
+	log.Printf("%s %s (was %s)", reason, l.Serial, l.Holder)
+	b.grantNextLocked(l.Serial)
+	b.saveStateLocked()
+}
+
+// grantNextLocked pops the queue head for serial and grants it a lease.
+// Other queued waiters from the same session piggyback on the same lease.
+func (b *Broker) grantNextLocked(serial string) {
+	q := b.queues[serial]
+	// Drop waiters whose client stopped polling.
+	now := time.Now()
+	alive := q[:0]
+	for _, wt := range q {
+		if wt.lease == nil && now.Sub(wt.LastPoll) > staleWaiter {
+			delete(b.waiters, wt.ID)
+			log.Printf("dropped stale waiter %s for %s", wt.Holder, serial)
+			continue
+		}
+		alive = append(alive, wt)
+	}
+	if len(alive) == 0 {
+		delete(b.queues, serial)
+		return
+	}
+	head := alive[0]
+	idle := head.IdleTTL
+	if idle <= 0 {
+		idle = time.Duration(b.cfg.IdleTTLSec) * time.Second
+	}
+	l := &Lease{
+		ID: b.newID("lease"), Serial: serial, Session: head.Session,
+		Holder: head.Holder,
+		AcquiredAt: now, LastActive: now, LastBeat: now,
+		IdleTTL: idle,
+	}
+	if head.Command {
+		l.Running = 1
+	}
+	b.leases[serial] = l
+	head.lease = l
+	close(head.ch)
+
+	rest := alive[1:]
+	remaining := []*Waiter{}
+	for _, wt := range rest {
+		if wt.Session == head.Session {
+			wt.lease = l
+			if wt.Command {
+				l.Running++
+			}
+			close(wt.ch)
+		} else {
+			remaining = append(remaining, wt)
+		}
+	}
+	if len(remaining) == 0 {
+		delete(b.queues, serial)
+	} else {
+		b.queues[serial] = remaining
+	}
+	b.hist("grant", l, "from queue")
+	log.Printf("granted %s to %s (from queue, %d still waiting)", serial, l.Holder, len(remaining))
+}
+
+// ---- background reaper ----
+
+func (b *Broker) reaper() {
+	for range time.Tick(reaperInterval) {
+		now := time.Now()
+		b.mu.Lock()
+		for _, l := range b.leases {
+			if !l.Claimed && now.Sub(l.AcquiredAt) > unclaimedGrace {
+				b.expireLocked(l, "unclaimed")
+				continue
+			}
+			if l.Running > 0 && now.Sub(l.LastBeat) > orphanBeat {
+				log.Printf("orphaned commands on %s (%s): resetting running count", l.Serial, l.Holder)
+				l.Running = 0
+				l.LastActive = now
+			}
+			switch {
+			case l.Explicit:
+				if l.Running == 0 && now.After(l.ExpiresAt) {
+					b.expireLocked(l, "expired")
+				}
+			default:
+				if l.Running == 0 && now.Sub(l.LastActive) > l.IdleTTL {
+					b.expireLocked(l, "idle-released")
+				}
+			}
+		}
+		// GC waiters that were granted but never picked up their lease.
+		for id, wt := range b.waiters {
+			if wt.lease != nil && now.Sub(wt.LastPoll) > staleWaiter {
+				delete(b.waiters, id)
+			}
+		}
+		b.mu.Unlock()
+	}
+}
+
+// ---- persistence & history ----
+
+type persistedState struct {
+	Leases []*Lease `json:"leases"`
+}
+
+func (b *Broker) saveStateLocked() {
+	st := persistedState{}
+	for _, l := range b.leases {
+		st.Leases = append(st.Leases, l)
+	}
+	data, err := json.MarshalIndent(st, "", "  ")
+	if err != nil {
+		return
+	}
+	tmp := StatePath() + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err == nil {
+		os.Rename(tmp, StatePath())
+	}
+}
+
+func (b *Broker) loadState() {
+	data, err := os.ReadFile(StatePath())
+	if err != nil {
+		return
+	}
+	var st persistedState
+	if json.Unmarshal(data, &st) != nil {
+		return
+	}
+	b.mu.Lock()
+	for _, l := range st.Leases {
+		// Restored leases have no live commands; idle expiry takes over.
+		l.Running = 0
+		l.Claimed = true
+		l.LastBeat = time.Now()
+		b.leases[l.Serial] = l
+		log.Printf("restored lease on %s for %s", l.Serial, l.Holder)
+	}
+	b.mu.Unlock()
+}
+
+func (b *Broker) hist(event string, l *Lease, note string) {
+	f, err := os.OpenFile(HistoryPath(), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	rec := map[string]any{
+		"ts": time.Now().Format(time.RFC3339), "event": event,
+		"serial": l.Serial, "session": l.Session, "holder": l.Holder, "lease_id": l.ID,
+	}
+	if note != "" {
+		rec["note"] = note
+	}
+	data, _ := json.Marshal(rec)
+	f.Write(append(data, '\n'))
+}
+
+func writeJSON(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(v)
+}
