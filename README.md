@@ -27,7 +27,7 @@ adb-lock who-has-device --serial SERIAL_1
 
 ## Status
 
-Early — the [PRD](PRD.md) is written, implementation is starting. v1 targets a single host: local broker process, CLI, SQLite-backed state, serial-based locking, install tracking, and auto-uninstall on release. HTTP API, heartbeats, and multi-device scheduling follow.
+Early — the [PRD](docs/PRD.md) is written, implementation is starting. v1 targets a single host: local broker process, CLI, SQLite-backed state, serial-based locking, install tracking, and auto-uninstall on release. HTTP API, heartbeats, and multi-device scheduling follow.
 
 One contract drives the design: **no ADB access without a lease, and every lease ends with deterministic cleanup.**
 
