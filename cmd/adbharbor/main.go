@@ -36,7 +36,7 @@ in a FIFO queue while another session holds the device.
 
 Environment:
   ADB_HARBOR_SESSION  Explicit session key (otherwise auto-detected)
-  ADB_HARBOR_IDLE     Seconds a lease lingers after the last command (default 60)
+  ADB_HARBOR_IDLE     Seconds a lease lingers after the last command (default 300)
   ADB_HARBOR_WAIT     Max seconds to wait for a busy device (default 600)
   ADB_HARBOR_ADB      Path to the real adb binary (overrides config)
   ADB_HARBOR_DIR      Data directory (default ~/.adbharbor)

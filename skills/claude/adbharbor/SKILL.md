@@ -27,8 +27,8 @@ take the lease.
   free device.
 - All commands from YOUR session share one lease: your install → launch →
   test sequence cannot be interleaved by another agent. The lease lingers
-  ~60s after your last adb command, then the device passes to the next
-  session in the queue.
+  ~5 minutes after your last adb command, then the device passes to the
+  next session in the queue.
 - Automation daemons (e.g. DroidRunner CI jobs) are brokered too: while a
   job runs its device shows as held (session like `bun-...`) and your
   commands queue behind it — this is normal, wait or pick another device.

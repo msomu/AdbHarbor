@@ -17,7 +17,7 @@ AdbHarbor brokers at **two layers**, so no agent, script, or tool needs to chang
 Shared semantics at both layers:
 
 - One lease per device per **session** (auto-detected: every command from the same Claude/Codex/terminal/daemon process tree shares one lease). Same-session commands run concurrently.
-- Other sessions **wait in a FIFO queue**; after a session's last command the lease lingers (default 60s) so an agent keeps ownership across consecutive commands.
+- Other sessions **wait in a FIFO queue**; after a session's last command the lease lingers (default 5 min) so an agent keeps ownership across consecutive commands and think-time gaps.
 - **Read-only commands are lease-exempt** (`getprop`, `dumpsys`, `pm list`, `settings get`, …): device-inventory heartbeats from tools like DroidRunner never squat a device and never stall behind a busy one.
 - Crash-safe: heartbeats, orphan detection, and unclaimed-grant reclaim clean up after killed clients automatically. Any broker failure **fails open** to plain adb.
 
