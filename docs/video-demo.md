@@ -19,8 +19,10 @@ pkill -f ".adbharbor/bin/adb " 2>/dev/null; adbharbor stop; rm -f ~/.adbharbor/s
 adbharbor cleanup on          # for the finale
 adbharbor devices             # daemon restarts; both devices free
 
-# every pane: fast handoffs + readable holder names for the camera
-export S=<PIXEL_SERIAL> APK=<path-to-any-debug.apk> PKG=<its.package.name>
+# every pane: fill in YOUR values (no angle brackets — they break zsh)
+S=YOUR_PIXEL_SERIAL
+APK=/path/to/any/app-debug.apk
+PKG=the.apps.package.name
 # left pane:   export ADB_HARBOR_SESSION=claude ADB_HARBOR_IDLE=5
 # right pane:  export ADB_HARBOR_SESSION=codex  ADB_HARBOR_IDLE=5
 
