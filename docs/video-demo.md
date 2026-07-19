@@ -113,6 +113,9 @@ adbharbor cleanup off   # restore your default
 
 ## Gotchas
 
+- Needs adbharbor >= 0.3.2: earlier versions let scrcpy's mirror stream
+  take the device lease, queueing everyone behind your own screen mirror.
+
 - `ADB_HARBOR_IDLE=5` in the agent panes is what keeps the video fast;
   the real default linger is 5 minutes.
 - Don't use `echo`/`getprop` as the *contended* command — read-only

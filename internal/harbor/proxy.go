@@ -164,7 +164,16 @@ func (b *Broker) proxyConn(c net.Conn) {
 			return
 		}
 
-		session, procName := b.sessionForConn(c)
+		session, procName, observer := b.sessionForConn(c)
+		if observer {
+			// Passive tools (screen mirrors) stream forever but must not
+			// own the device.
+			if err := writeMsg(up, svc); err != nil {
+				return
+			}
+			splice(c, up)
+			return
+		}
 		lease, err := b.AcquireLocalBlocking(AcquireReq{
 			Serial:  serial,
 			Session: session,
@@ -220,16 +229,21 @@ func (b *Broker) soleOnlineSerial() string {
 	return sole
 }
 
-func (b *Broker) sessionForConn(c net.Conn) (session, procName string) {
+func (b *Broker) sessionForConn(c net.Conn) (session, procName string, observer bool) {
 	addr, ok := c.RemoteAddr().(*net.TCPAddr)
 	if !ok {
-		return "unknown", "unknown"
+		return "unknown", "unknown", false
 	}
 	pid, name, err := peerPID(addr.Port)
 	if err != nil || pid <= 0 {
-		return fmt.Sprintf("port-%d", addr.Port), "unknown"
+		return fmt.Sprintf("port-%d", addr.Port), "unknown", false
 	}
-	return DetectSessionForPID(pid, b.config()), name
+	cfg := b.config()
+	if isObserverProc(name, cfg.ObserverProcs) {
+		return name, name, true
+	}
+	session, observer = classifyPID(pid, cfg)
+	return session, name, observer
 }
 
 // ---- transport request parsing ----
@@ -251,6 +265,15 @@ func parseTransport(req string) (transportReq, bool) {
 		return transportReq{tport: true}, true
 	}
 	return transportReq{}, false
+}
+
+func isObserverProc(name string, observers []string) bool {
+	for _, o := range observers {
+		if name == o || (len(o) >= 5 && strings.Contains(name, o)) {
+			return true
+		}
+	}
+	return false
 }
 
 // isExemptService reports whether a device service is read-only enough to

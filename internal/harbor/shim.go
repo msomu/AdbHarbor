@@ -64,7 +64,12 @@ func RunShim(args []string) int {
 		return execReal(real, args, execEnv)
 	}
 
-	session := DetectSession(cfg)
+	session, observer := DetectSessionObserver(cfg)
+	if observer {
+		// scrcpy-style observer tools stream through adb but must not own
+		// the device.
+		return execReal(real, args, execEnv)
+	}
 	req := AcquireReq{
 		Serial:     serial,
 		Session:    session,

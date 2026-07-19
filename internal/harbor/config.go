@@ -34,6 +34,10 @@ type Config struct {
 	// run without a lease (so device-inventory heartbeats from tools like
 	// DroidRunner never squat a device or stall behind a busy one).
 	ExemptShell []string `json:"exempt_shell_prefixes"`
+	// ObserverProcs are client process names whose connections never take a
+	// lease — passive tools like screen mirrors (scrcpy) that hold
+	// long-lived device streams but shouldn't own the device.
+	ObserverProcs []string `json:"observer_process_names"`
 	// CleanupEnabled uninstalls packages that appeared on a device during a
 	// session when that session's lease ends (snapshot diff), leaving the
 	// device clean for the next job. Off by default; toggle with
@@ -60,6 +64,7 @@ func DefaultConfig() *Config {
 			"wm size", "wm density", "cmd package list", "ime list",
 			"getenforce", "echo", "uptime",
 		},
+		ObserverProcs:  []string{"scrcpy"},
 		CleanupEnabled: false,
 		ProtectedPackages: []string{
 			"android", "com.android.", "com.google.", "com.samsung.", "com.sec.",
