@@ -30,12 +30,14 @@ studio ──ddmlib────────▶ :5037 harbor proxy ─(exempt/lea
 
 ## Install
 
-Requires Go 1.22+ and the Android platform-tools.
+Requires the Android platform-tools.
 
 ```bash
-go install github.com/msomu/AdbHarbor/cmd/adbharbor@latest
+brew install msomu/tap/adbharbor
 adbharbor install
 ```
+
+Or with Go 1.22+: `go install github.com/msomu/AdbHarbor/cmd/adbharbor@latest && adbharbor install`
 
 Or from a clone: `go build -o adbharbor ./cmd/adbharbor && ./adbharbor install`
 
