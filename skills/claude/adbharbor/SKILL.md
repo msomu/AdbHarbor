@@ -58,3 +58,7 @@ adbharbor release -s SERIAL             # release your own lease early
    than the idle linger.
 4. If adb prints `running unlocked` warnings, the broker is down —
    locking is bypassed (fail-open). `adbharbor doctor` diagnoses.
+5. If `adbharbor cleanup` reports ENABLED, apps you install are
+   auto-uninstalled when your session's lease ends — reinstall on the next
+   session instead of assuming state persists, and finish install→test
+   sequences without long idle gaps.

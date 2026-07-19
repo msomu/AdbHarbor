@@ -51,9 +51,16 @@ adbharbor status               # all leases and queues
 adbharbor who -s SERIAL        # who holds one device
 adbharbor acquire -s SERIAL --ttl 30m   # hold a device explicitly
 adbharbor release -s SERIAL [--force]
+adbharbor cleanup [on|off]     # uninstall-on-release of session apps (default: off)
 adbharbor doctor               # check shim, real adb, daemon, session detection
 adbharbor stop | daemon | uninstall
 ```
+
+## Session cleanup (opt-in)
+
+`adbharbor cleanup on` makes every lease end with a cleanup pass: the broker snapshots the device's package list when a session's lease is granted and diffs it when the lease ends — anything that appeared during the session is uninstalled before the device goes to the next waiter (shown as `session cleanup` in `adbharbor devices`).
+
+The snapshot-diff design means it catches every install mechanism (`adb install`, streamed installs, `pm install`, Maestro-driven installs) without parsing anything, and **can never remove an app that predates the session** — pre-existing apps that get *upgraded* during a session also survive. Package prefixes in `protected_package_prefixes` (`android`, `com.android.`, `com.google.`, …) are never uninstalled regardless. Cleanup results land in `~/.adbharbor/history.jsonl`; failures are logged and never block the device handoff. A running daemon picks up the toggle within seconds — no restart needed.
 
 ## Behavior reference
 
@@ -85,7 +92,6 @@ Agents need zero changes to *work* — the shim is transparent. To make them *sm
 - Clients that pin `ANDROID_ADB_SERVER_PORT` to a non-default port connect around the proxy.
 - A client that chains a plain `host:*` query and a transport on one connection is relayed raw after the first query (rare; standard adb CLI and dadb open fresh connections).
 - Single host only — the broker and phones live on the same machine (matching ADB's host-local server). See [docs/PRD.md](docs/PRD.md) for the HTTP/remote roadmap.
-- Cleanup policies (auto-uninstall of session-installed apps) are specced in the PRD but not yet implemented; lease events are already recorded in the history log.
 
 ## License
 

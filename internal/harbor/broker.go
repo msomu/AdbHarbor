@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -42,6 +43,9 @@ type Lease struct {
 	// Claimed is false for a lease granted from the queue until its owner
 	// shows a sign of life (wait pickup, heartbeat, or command end).
 	Claimed bool `json:"claimed"`
+	// Baseline is the device's package list at grant time, used by session
+	// cleanup to uninstall only what this session installed.
+	Baseline []string `json:"pkg_baseline,omitempty"`
 }
 
 type Waiter struct {
@@ -58,13 +62,17 @@ type Waiter struct {
 }
 
 type Broker struct {
-	mu      sync.Mutex
-	cfg     *Config
-	leases  map[string]*Lease  // by serial
-	queues  map[string][]*Waiter
-	waiters map[string]*Waiter // by waiter ID
-	seq     int64
+	mu       sync.Mutex
+	cfg      atomic.Pointer[Config] // hot-reloaded; read via b.config()
+	leases   map[string]*Lease  // by serial
+	queues   map[string][]*Waiter
+	waiters  map[string]*Waiter // by waiter ID
+	cleaning map[string]bool    // serials in post-session cleanup
+	cfgMTime time.Time
+	seq      int64
 }
+
+func (b *Broker) config() *Config { return b.cfg.Load() }
 
 // RunDaemon starts the broker on the harbor unix socket (foreground).
 func RunDaemon() error {
@@ -90,14 +98,18 @@ func RunDaemon() error {
 	os.WriteFile(PIDPath(), []byte(fmt.Sprintf("%d\n", os.Getpid())), 0o600)
 
 	b := &Broker{
-		cfg:     LoadConfig(),
-		leases:  map[string]*Lease{},
-		queues:  map[string][]*Waiter{},
-		waiters: map[string]*Waiter{},
+		leases:   map[string]*Lease{},
+		queues:   map[string][]*Waiter{},
+		waiters:  map[string]*Waiter{},
+		cleaning: map[string]bool{},
+	}
+	b.cfg.Store(LoadConfig())
+	if info, err := os.Stat(ConfigPath()); err == nil {
+		b.cfgMTime = info.ModTime()
 	}
 	b.loadState()
 	go b.reaper()
-	if b.cfg.ProxyEnabled {
+	if b.config().ProxyEnabled {
 		go func() {
 			if err := b.runProxy(); err != nil {
 				log.Printf("proxy disabled: %v", err)
@@ -143,6 +155,16 @@ func leaseDesc(l *Lease) string {
 	return fmt.Sprintf("%s for %s", l.Holder, time.Since(l.AcquiredAt).Round(time.Second))
 }
 
+func (b *Broker) serialDescLocked(serial string) string {
+	if l := b.leases[serial]; l != nil {
+		return leaseDesc(l)
+	}
+	if b.cleaning[serial] {
+		return "session cleanup"
+	}
+	return "free"
+}
+
 // ---- handlers ----
 
 func (b *Broker) handlePing(w http.ResponseWriter, _ *http.Request) {
@@ -156,7 +178,7 @@ func (b *Broker) handleAcquire(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now()
-	idle := time.Duration(b.cfg.IdleTTLSec) * time.Second
+	idle := time.Duration(b.config().IdleTTLSec) * time.Second
 	if req.IdleTTLSec > 0 {
 		idle = time.Duration(req.IdleTTLSec) * time.Second
 	}
@@ -171,7 +193,7 @@ func (b *Broker) handleAcquire(w http.ResponseWriter, r *http.Request) {
 	resp := AcquireResp{
 		WaiterID:   wt.ID,
 		Position:   len(b.queues[req.Serial]),
-		HolderDesc: leaseDesc(b.leases[req.Serial]),
+		HolderDesc: b.serialDescLocked(req.Serial),
 	}
 	b.mu.Unlock()
 	writeJSON(w, resp)
@@ -180,6 +202,16 @@ func (b *Broker) handleAcquire(w http.ResponseWriter, r *http.Request) {
 // acquireLocked grants (or renews) a lease, or enqueues a waiter when the
 // device is held by another session. Exactly one return value is non-nil.
 func (b *Broker) acquireLocked(req AcquireReq, now time.Time, idle time.Duration) (*Lease, *Waiter) {
+	if b.cleaning[req.Serial] {
+		wt := &Waiter{
+			ID: b.newID("w"), Serial: req.Serial, Session: req.Session,
+			Holder: req.Holder, Command: req.Command, IdleTTL: idle,
+			Enqueued: now, LastPoll: now, ch: make(chan struct{}),
+		}
+		b.queues[req.Serial] = append(b.queues[req.Serial], wt)
+		b.waiters[wt.ID] = wt
+		return nil, wt
+	}
 	l := b.leases[req.Serial]
 	if l != nil && l.Session == req.Session {
 		// Same session: renew the existing lease.
@@ -217,7 +249,7 @@ func (b *Broker) AcquireLocalBlocking(req AcquireReq, waitSec int, abort <-chan 
 	if waitSec > 0 {
 		deadline = time.Now().Add(time.Duration(waitSec) * time.Second)
 	}
-	idle := time.Duration(b.cfg.IdleTTLSec) * time.Second
+	idle := time.Duration(b.config().IdleTTLSec) * time.Second
 	if req.IdleTTLSec > 0 {
 		idle = time.Duration(req.IdleTTLSec) * time.Second
 	}
@@ -322,7 +354,7 @@ func (b *Broker) explicitTTL(req AcquireReq) time.Duration {
 	if req.TTLSec > 0 {
 		return time.Duration(req.TTLSec) * time.Second
 	}
-	return time.Duration(b.cfg.ExplicitTTLSec) * time.Second
+	return time.Duration(b.config().ExplicitTTLSec) * time.Second
 }
 
 // grantLocked creates a fresh lease for an acquire request.
@@ -342,6 +374,9 @@ func (b *Broker) grantLocked(req AcquireReq, now time.Time, idle time.Duration) 
 	b.leases[req.Serial] = l
 	b.hist("grant", l, "")
 	log.Printf("granted %s to %s", l.Serial, l.Holder)
+	if b.config().CleanupEnabled {
+		go b.captureBaseline(l.ID, l.Serial)
+	}
 	b.saveStateLocked()
 	return l
 }
@@ -394,7 +429,7 @@ func (b *Broker) handleWait(w http.ResponseWriter, r *http.Request) {
 		b.mu.Lock()
 		wt.LastPoll = time.Now()
 		pos := b.positionLocked(wt)
-		desc := leaseDesc(b.leases[wt.Serial])
+		desc := b.serialDescLocked(wt.Serial)
 		b.mu.Unlock()
 		writeJSON(w, WaitResp{Position: pos, HolderDesc: desc})
 	case <-r.Context().Done():
@@ -488,7 +523,7 @@ func (b *Broker) handleState(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (b *Broker) handleDevices(w http.ResponseWriter, _ *http.Request) {
-	devs, err := ListDevices(b.cfg.RealADB, b.cfg.ClientServerPort())
+	devs, err := ListDevices(b.config().RealADB, b.config().ClientServerPort())
 	resp := DevicesResp{}
 	if err != nil {
 		resp.Error = err.Error()
@@ -501,6 +536,7 @@ func (b *Broker) handleDevices(w http.ResponseWriter, _ *http.Request) {
 			di.Lease = &info
 		}
 		di.Waiting = len(b.queues[d.Serial])
+		di.Cleaning = b.cleaning[d.Serial]
 		resp.Devices = append(resp.Devices, di)
 	}
 	// Leases for devices that disappeared still matter.
@@ -546,11 +582,18 @@ func (b *Broker) leaseByIDLocked(id string) *Lease {
 	return nil
 }
 
-// expireLocked removes a lease and hands the device to the next session.
+// expireLocked removes a lease and hands the device to the next session —
+// via a cleanup pass first when enabled and a baseline exists.
 func (b *Broker) expireLocked(l *Lease, reason string) {
 	delete(b.leases, l.Serial)
 	b.hist(reason, l, fmt.Sprintf("held %s", time.Since(l.AcquiredAt).Round(time.Second)))
 	log.Printf("%s %s (was %s)", reason, l.Serial, l.Holder)
+	if b.config().CleanupEnabled && len(l.Baseline) > 0 && !b.cleaning[l.Serial] {
+		b.cleaning[l.Serial] = true
+		go b.runCleanup(l)
+		b.saveStateLocked()
+		return
+	}
 	b.grantNextLocked(l.Serial)
 	b.saveStateLocked()
 }
@@ -578,7 +621,7 @@ func (b *Broker) grantNextLocked(serial string) {
 	head := alive[0]
 	idle := head.IdleTTL
 	if idle <= 0 {
-		idle = time.Duration(b.cfg.IdleTTLSec) * time.Second
+		idle = time.Duration(b.config().IdleTTLSec) * time.Second
 	}
 	l := &Lease{
 		ID: b.newID("lease"), Serial: serial, Session: head.Session,
@@ -613,6 +656,9 @@ func (b *Broker) grantNextLocked(serial string) {
 	}
 	b.hist("grant", l, "from queue")
 	log.Printf("granted %s to %s (from queue, %d still waiting)", serial, l.Holder, len(remaining))
+	if b.config().CleanupEnabled {
+		go b.captureBaseline(l.ID, serial)
+	}
 }
 
 // ---- background reaper ----
@@ -620,6 +666,7 @@ func (b *Broker) grantNextLocked(serial string) {
 func (b *Broker) reaper() {
 	for range time.Tick(reaperInterval) {
 		now := time.Now()
+		b.reloadConfigIfChanged()
 		b.mu.Lock()
 		for _, l := range b.leases {
 			if !l.Claimed && now.Sub(l.AcquiredAt) > unclaimedGrace {
@@ -649,6 +696,24 @@ func (b *Broker) reaper() {
 			}
 		}
 		b.mu.Unlock()
+	}
+}
+
+// reloadConfigIfChanged picks up config edits (e.g. `adbharbor cleanup on`)
+// without a daemon restart.
+func (b *Broker) reloadConfigIfChanged() {
+	info, err := os.Stat(ConfigPath())
+	if err != nil || info.ModTime().Equal(b.cfgMTime) {
+		return
+	}
+	cfg := LoadConfig()
+	was := b.config().CleanupEnabled
+	b.cfg.Store(cfg)
+	b.cfgMTime = info.ModTime()
+	if was != cfg.CleanupEnabled {
+		log.Printf("config reloaded: cleanup %s", map[bool]string{true: "ENABLED", false: "disabled"}[cfg.CleanupEnabled])
+	} else {
+		log.Printf("config reloaded")
 	}
 }
 

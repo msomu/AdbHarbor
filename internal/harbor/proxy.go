@@ -28,7 +28,7 @@ var proxyDebug = os.Getenv("ADB_HARBOR_DEBUG") == "1"
 // device-mutating services, then splices bytes.
 
 func (b *Broker) runProxy() error {
-	addr := fmt.Sprintf("127.0.0.1:%d", b.cfg.ProxyPort)
+	addr := fmt.Sprintf("127.0.0.1:%d", b.config().ProxyPort)
 	var ln net.Listener
 	var err error
 	for attempt := 0; attempt < 10; attempt++ {
@@ -39,8 +39,8 @@ func (b *Broker) runProxy() error {
 		// Port busy: a classic adb server owns it. Evict it (it will be
 		// re-homed on AdbServerPort) and retry.
 		log.Printf("proxy: %s busy, evicting classic adb server", addr)
-		killCmd := exec.Command(b.cfg.RealADB, "kill-server")
-		killCmd.Env = envWithServerPort(os.Environ(), b.cfg.ProxyPort)
+		killCmd := exec.Command(b.config().RealADB, "kill-server")
+		killCmd.Env = envWithServerPort(os.Environ(), b.config().ProxyPort)
 		_ = killCmd.Run()
 		time.Sleep(300 * time.Millisecond)
 	}
@@ -48,7 +48,7 @@ func (b *Broker) runProxy() error {
 		return fmt.Errorf("could not take over ADB server port: %w", err)
 	}
 	b.ensureRealServer()
-	log.Printf("proxy: brokering ADB server port %d (real server on %d)", b.cfg.ProxyPort, b.cfg.AdbServerPort)
+	log.Printf("proxy: brokering ADB server port %d (real server on %d)", b.config().ProxyPort, b.config().AdbServerPort)
 	for {
 		c, err := ln.Accept()
 		if err != nil {
@@ -65,8 +65,8 @@ func (b *Broker) ensureRealServer() {
 	if b.dialReal(200*time.Millisecond) == nil {
 		return
 	}
-	cmd := exec.Command(b.cfg.RealADB, "start-server")
-	cmd.Env = envWithServerPort(os.Environ(), b.cfg.AdbServerPort)
+	cmd := exec.Command(b.config().RealADB, "start-server")
+	cmd.Env = envWithServerPort(os.Environ(), b.config().AdbServerPort)
 	if err := cmd.Run(); err != nil {
 		log.Printf("proxy: starting real adb server: %v", err)
 		return
@@ -77,11 +77,11 @@ func (b *Broker) ensureRealServer() {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	log.Printf("proxy: real adb server did not come up on %d", b.cfg.AdbServerPort)
+	log.Printf("proxy: real adb server did not come up on %d", b.config().AdbServerPort)
 }
 
 func (b *Broker) dialReal(timeout time.Duration) error {
-	c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", b.cfg.AdbServerPort), timeout)
+	c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", b.config().AdbServerPort), timeout)
 	if err != nil {
 		return err
 	}
@@ -90,7 +90,7 @@ func (b *Broker) dialReal(timeout time.Duration) error {
 }
 
 func (b *Broker) dialUpstream() (net.Conn, error) {
-	addr := fmt.Sprintf("127.0.0.1:%d", b.cfg.AdbServerPort)
+	addr := fmt.Sprintf("127.0.0.1:%d", b.config().AdbServerPort)
 	c, err := net.DialTimeout("tcp", addr, 2*time.Second)
 	if err == nil {
 		return c, nil
@@ -156,7 +156,7 @@ func (b *Broker) proxyConn(c net.Conn) {
 
 		// After transport: req is the device service.
 		svc := req
-		if serial == "" || isExemptService(svc, b.cfg.ExemptShell) {
+		if serial == "" || isExemptService(svc, b.config().ExemptShell) {
 			if err := writeMsg(up, svc); err != nil {
 				return
 			}
@@ -170,7 +170,7 @@ func (b *Broker) proxyConn(c net.Conn) {
 			Session: session,
 			Holder:  fmt.Sprintf("%s (%s)", session, procName),
 			Command: true,
-		}, b.cfg.WaitSec, nil)
+		}, b.config().WaitSec, nil)
 		if err != nil {
 			log.Printf("proxy: %s denied %s on %s: %v", session, firstLine(svc), serial, err)
 			writeFail(c, fmt.Sprintf("adbharbor: device %s is busy (%v); see `adbharbor who -s %s`", serial, err, serial))
@@ -203,7 +203,7 @@ func (b *Broker) proxyConn(c net.Conn) {
 // soleOnlineSerial resolves transport-any style requests: if exactly one
 // device is online we can still broker; otherwise stay hands-off.
 func (b *Broker) soleOnlineSerial() string {
-	devs, err := ListDevices(b.cfg.RealADB, b.cfg.AdbServerPort)
+	devs, err := ListDevices(b.config().RealADB, b.config().AdbServerPort)
 	if err != nil {
 		return ""
 	}
@@ -229,7 +229,7 @@ func (b *Broker) sessionForConn(c net.Conn) (session, procName string) {
 	if err != nil || pid <= 0 {
 		return fmt.Sprintf("port-%d", addr.Port), "unknown"
 	}
-	return DetectSessionForPID(pid, b.cfg), name
+	return DetectSessionForPID(pid, b.config()), name
 }
 
 // ---- transport request parsing ----

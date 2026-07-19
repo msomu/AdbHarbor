@@ -29,6 +29,9 @@ func CmdDevices() error {
 	sort.Slice(resp.Devices, func(i, j int) bool { return resp.Devices[i].Serial < resp.Devices[j].Serial })
 	for _, d := range resp.Devices {
 		lease := "free"
+		if d.Cleaning {
+			lease = "session cleanup"
+		}
 		if d.Lease != nil {
 			lease = fmt.Sprintf("%s (%s%s)", d.Lease.Holder,
 				time.Since(d.Lease.AcquiredAt).Round(time.Second), runningSuffix(d.Lease.Running))
@@ -187,6 +190,40 @@ func serialArg(args []string, cmd string) (string, error) {
 		return "", fmt.Errorf("%s: -s SERIAL is required", cmd)
 	}
 	return *serial, nil
+}
+
+// CmdCleanup shows or toggles session cleanup (uninstall-on-release).
+func CmdCleanup(args []string) error {
+	cfg := LoadRawConfig()
+	if len(args) == 0 {
+		state := "disabled"
+		if cfg.CleanupEnabled {
+			state = "ENABLED"
+		}
+		fmt.Printf("session cleanup: %s\n", state)
+		fmt.Println("  when enabled, packages installed during a session are uninstalled")
+		fmt.Println("  when its lease ends (snapshot diff; pre-existing apps are never touched)")
+		fmt.Printf("  protected prefixes: %s\n", strings.Join(cfg.ProtectedPackages, ", "))
+		fmt.Println("  toggle with: adbharbor cleanup on | adbharbor cleanup off")
+		return nil
+	}
+	switch args[0] {
+	case "on", "enable":
+		cfg.CleanupEnabled = true
+	case "off", "disable":
+		cfg.CleanupEnabled = false
+	default:
+		return fmt.Errorf("cleanup: use `on`, `off`, or no argument for status")
+	}
+	if err := cfg.Save(); err != nil {
+		return err
+	}
+	state := "disabled"
+	if cfg.CleanupEnabled {
+		state = "enabled"
+	}
+	fmt.Printf("session cleanup %s (a running daemon picks this up within seconds)\n", state)
+	return nil
 }
 
 func CmdDoctor() error {

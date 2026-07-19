@@ -79,11 +79,12 @@ type StateResp struct {
 }
 
 type DeviceInfo struct {
-	Serial  string     `json:"serial"`
-	State   string     `json:"state"`
-	Model   string     `json:"model,omitempty"`
-	Lease   *LeaseInfo `json:"lease,omitempty"`
-	Waiting int        `json:"waiting"`
+	Serial   string     `json:"serial"`
+	State    string     `json:"state"`
+	Model    string     `json:"model,omitempty"`
+	Lease    *LeaseInfo `json:"lease,omitempty"`
+	Waiting  int        `json:"waiting"`
+	Cleaning bool       `json:"cleaning,omitempty"`
 }
 
 type DevicesResp struct {

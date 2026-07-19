@@ -23,6 +23,8 @@ Usage:
                                 Hold a device explicitly (until release or TTL)
   adbharbor release -s SERIAL [--force]
                                 Release a lease (--force releases someone else's)
+  adbharbor cleanup [on|off]    Show or toggle uninstall-on-release of
+                                session-installed apps (default: off)
   adbharbor doctor              Check shim, real adb, daemon, session detection
   adbharbor daemon              Run the broker in the foreground (usually automatic)
   adbharbor stop                Stop the broker daemon
@@ -74,6 +76,8 @@ func main() {
 		err = harbor.CmdRelease(args[1:], false)
 	case "force-release":
 		err = harbor.CmdRelease(args[1:], true)
+	case "cleanup":
+		err = harbor.CmdCleanup(args[1:])
 	case "doctor":
 		err = harbor.CmdDoctor()
 	case "shim":

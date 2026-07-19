@@ -34,6 +34,13 @@ type Config struct {
 	// run without a lease (so device-inventory heartbeats from tools like
 	// DroidRunner never squat a device or stall behind a busy one).
 	ExemptShell []string `json:"exempt_shell_prefixes"`
+	// CleanupEnabled uninstalls packages that appeared on a device during a
+	// session when that session's lease ends (snapshot diff), leaving the
+	// device clean for the next job. Off by default; toggle with
+	// `adbharbor cleanup on|off`.
+	CleanupEnabled bool `json:"cleanup_enabled"`
+	// ProtectedPackages are package-name prefixes cleanup never uninstalls.
+	ProtectedPackages []string `json:"protected_package_prefixes"`
 }
 
 func DefaultConfig() *Config {
@@ -53,7 +60,21 @@ func DefaultConfig() *Config {
 			"wm size", "wm density", "cmd package list", "ime list",
 			"getenforce", "echo", "uptime",
 		},
+		CleanupEnabled: false,
+		ProtectedPackages: []string{
+			"android", "com.android.", "com.google.", "com.samsung.", "com.sec.",
+		},
 	}
+}
+
+// LoadRawConfig reads the config file without environment overrides — use
+// this when mutating and re-saving so env vars don't get persisted.
+func LoadRawConfig() *Config {
+	cfg := DefaultConfig()
+	if data, err := os.ReadFile(ConfigPath()); err == nil {
+		_ = json.Unmarshal(data, cfg)
+	}
+	return cfg
 }
 
 // ClientServerPort is the ANDROID_ADB_SERVER_PORT the shim should hand the
