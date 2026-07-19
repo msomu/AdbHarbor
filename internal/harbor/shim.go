@@ -29,13 +29,21 @@ func RunShim(args []string) int {
 		return 1
 	}
 
+	// With the proxy owning the default server port, shim-managed commands
+	// talk straight to the real server: their locking happens here via the
+	// broker, so a second pass through the proxy would be redundant.
+	execEnv := os.Environ()
+	if p := cfg.ClientServerPort(); p > 0 && os.Getenv("ANDROID_ADB_SERVER_PORT") == "" {
+		execEnv = envWithServerPort(execEnv, p)
+	}
+
 	if os.Getenv("ADB_HARBOR_OFF") == "1" {
-		return execReal(real, args)
+		return execReal(real, args, execEnv)
 	}
 
 	inv := ParseInvocation(args)
 	if !inv.NeedsDevice() {
-		return execReal(real, args)
+		return execReal(real, args, execEnv)
 	}
 
 	serial := inv.Serial
@@ -43,17 +51,17 @@ func RunShim(args []string) int {
 		serial = os.Getenv("ANDROID_SERIAL")
 	}
 	if serial == "" {
-		serial = resolveSoleDevice(real, inv)
+		serial = resolveSoleDevice(real, cfg, inv)
 	}
 	if serial == "" {
 		// Can't tell which device this targets (0 or 2+ candidates);
 		// let the real adb produce its usual error / behavior.
-		return execReal(real, args)
+		return execReal(real, args, execEnv)
 	}
 
 	if err := EnsureDaemon(); err != nil {
 		fmt.Fprintf(os.Stderr, "adbharbor: broker unavailable (%v); running unlocked\n", err)
-		return execReal(real, args)
+		return execReal(real, args, execEnv)
 	}
 
 	session := DetectSession(cfg)
@@ -78,10 +86,10 @@ func RunShim(args []string) int {
 			return 75 // EX_TEMPFAIL: device busy, retry later
 		}
 		fmt.Fprintf(os.Stderr, "adbharbor: lease error (%v); running unlocked\n", err)
-		return execReal(real, args)
+		return execReal(real, args, execEnv)
 	}
 
-	code := runLeasedCommand(real, args, leaseID)
+	code := runLeasedCommand(real, args, leaseID, execEnv)
 	EndCommand(leaseID)
 	return code
 }
@@ -89,8 +97,9 @@ func RunShim(args []string) int {
 // runLeasedCommand runs the real adb as a child (so we can report command
 // completion afterwards), heartbeating the lease while it runs and
 // forwarding signals.
-func runLeasedCommand(real string, args []string, leaseID string) int {
+func runLeasedCommand(real string, args []string, leaseID string, env []string) int {
 	cmd := exec.Command(real, args...)
+	cmd.Env = env
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -140,17 +149,17 @@ func runLeasedCommand(real string, args []string, leaseID string) int {
 }
 
 // execReal replaces this process with the real adb (pure passthrough).
-func execReal(real string, args []string) int {
+func execReal(real string, args []string, env []string) int {
 	argv := append([]string{real}, args...)
-	err := syscall.Exec(real, argv, os.Environ())
+	err := syscall.Exec(real, argv, env)
 	fmt.Fprintln(os.Stderr, "adbharbor: exec real adb:", err)
 	return 127
 }
 
 // resolveSoleDevice returns the serial iff exactly one connected device
 // matches the invocation (so we know what to lock without -s).
-func resolveSoleDevice(real string, inv ADBInvocation) string {
-	devs, err := ListDevices(real)
+func resolveSoleDevice(real string, cfg *Config, inv ADBInvocation) string {
+	devs, err := ListDevices(real, cfg.ClientServerPort())
 	if err != nil {
 		return ""
 	}

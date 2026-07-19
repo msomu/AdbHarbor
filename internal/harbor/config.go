@@ -20,6 +20,20 @@ type Config struct {
 	// tree to identify which agent a command belongs to. The nearest
 	// matching ancestor's "name-pid" becomes the session key.
 	AgentProcs []string `json:"agent_process_names"`
+	// ProxyEnabled makes the daemon take over the default ADB server port
+	// (5037) and broker EVERY adb client — CLIs at any path, Maestro/dadb,
+	// ddmlib — with the real adb server moved to AdbServerPort. This is
+	// what makes third-party tools harbor-agnostic: on machines without
+	// AdbHarbor they hit a normal adb server, here they hit the broker.
+	ProxyEnabled bool `json:"proxy_enabled"`
+	// ProxyPort is where the harbor proxy listens (the ADB default, 5037).
+	ProxyPort int `json:"proxy_port"`
+	// AdbServerPort is where the real adb server is parked.
+	AdbServerPort int `json:"adb_server_port"`
+	// ExemptShell lists shell/exec command prefixes that are read-only and
+	// run without a lease (so device-inventory heartbeats from tools like
+	// DroidRunner never squat a device or stall behind a busy one).
+	ExemptShell []string `json:"exempt_shell_prefixes"`
 }
 
 func DefaultConfig() *Config {
@@ -31,7 +45,26 @@ func DefaultConfig() *Config {
 			"claude", "node", "bun", "deno", "codex",
 			"gemini", "aider", "goose", "amp", "cursor", "copilot",
 		},
+		ProxyEnabled:  true,
+		ProxyPort:     5037,
+		AdbServerPort: 5038,
+		ExemptShell: []string{
+			"getprop", "dumpsys", "pm list", "pm path", "settings get",
+			"wm size", "wm density", "cmd package list", "ime list",
+			"getenforce", "echo", "uptime",
+		},
 	}
+}
+
+// ClientServerPort is the ANDROID_ADB_SERVER_PORT the shim should hand the
+// real adb CLI: with the proxy owning 5037, shim-managed commands go
+// straight to the real server (their lease is already held).
+// 0 means "leave the environment alone".
+func (c *Config) ClientServerPort() int {
+	if c.ProxyEnabled {
+		return c.AdbServerPort
+	}
+	return 0
 }
 
 func LoadConfig() *Config {

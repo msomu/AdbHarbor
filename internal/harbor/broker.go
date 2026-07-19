@@ -97,6 +97,13 @@ func RunDaemon() error {
 	}
 	b.loadState()
 	go b.reaper()
+	if b.cfg.ProxyEnabled {
+		go func() {
+			if err := b.runProxy(); err != nil {
+				log.Printf("proxy disabled: %v", err)
+			}
+		}()
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/ping", b.handlePing)
@@ -155,13 +162,30 @@ func (b *Broker) handleAcquire(w http.ResponseWriter, r *http.Request) {
 	}
 
 	b.mu.Lock()
-	defer b.mu.Unlock()
+	l, wt := b.acquireLocked(req, now, idle)
+	if l != nil {
+		b.mu.Unlock()
+		writeJSON(w, AcquireResp{Granted: true, LeaseID: l.ID})
+		return
+	}
+	resp := AcquireResp{
+		WaiterID:   wt.ID,
+		Position:   len(b.queues[req.Serial]),
+		HolderDesc: leaseDesc(b.leases[req.Serial]),
+	}
+	b.mu.Unlock()
+	writeJSON(w, resp)
+}
 
+// acquireLocked grants (or renews) a lease, or enqueues a waiter when the
+// device is held by another session. Exactly one return value is non-nil.
+func (b *Broker) acquireLocked(req AcquireReq, now time.Time, idle time.Duration) (*Lease, *Waiter) {
 	l := b.leases[req.Serial]
 	if l != nil && l.Session == req.Session {
 		// Same session: renew the existing lease.
 		l.LastActive, l.LastBeat = now, now
 		l.IdleTTL = idle
+		l.Claimed = true
 		if req.Command {
 			l.Running++
 		}
@@ -169,15 +193,11 @@ func (b *Broker) handleAcquire(w http.ResponseWriter, r *http.Request) {
 			l.Explicit = true
 			l.ExpiresAt = now.Add(b.explicitTTL(req))
 		}
-		writeJSON(w, AcquireResp{Granted: true, LeaseID: l.ID})
-		return
+		return l, nil
 	}
 	if l == nil {
-		l = b.grantLocked(req, now, idle)
-		writeJSON(w, AcquireResp{Granted: true, LeaseID: l.ID})
-		return
+		return b.grantLocked(req, now, idle), nil
 	}
-	// Busy: enqueue.
 	wt := &Waiter{
 		ID: b.newID("w"), Serial: req.Serial, Session: req.Session,
 		Holder: req.Holder, Command: req.Command, IdleTTL: idle,
@@ -186,11 +206,116 @@ func (b *Broker) handleAcquire(w http.ResponseWriter, r *http.Request) {
 	b.queues[req.Serial] = append(b.queues[req.Serial], wt)
 	b.waiters[wt.ID] = wt
 	log.Printf("queued %s for %s (held by %s, %d waiting)", req.Holder, req.Serial, l.Holder, len(b.queues[req.Serial]))
-	writeJSON(w, AcquireResp{
-		WaiterID:   wt.ID,
-		Position:   len(b.queues[req.Serial]),
-		HolderDesc: leaseDesc(l),
-	})
+	return nil, wt
+}
+
+// AcquireLocalBlocking is the in-process equivalent of the HTTP acquire +
+// wait long-poll, used by the ADB server proxy. It blocks until the lease
+// is granted, waitSec elapses, or abort closes.
+func (b *Broker) AcquireLocalBlocking(req AcquireReq, waitSec int, abort <-chan struct{}) (*Lease, error) {
+	var deadline time.Time
+	if waitSec > 0 {
+		deadline = time.Now().Add(time.Duration(waitSec) * time.Second)
+	}
+	idle := time.Duration(b.cfg.IdleTTLSec) * time.Second
+	if req.IdleTTLSec > 0 {
+		idle = time.Duration(req.IdleTTLSec) * time.Second
+	}
+	for {
+		b.mu.Lock()
+		l, wt := b.acquireLocked(req, time.Now(), idle)
+		b.mu.Unlock()
+		if l != nil {
+			return l, nil
+		}
+		granted, err := b.waitLocal(wt, deadline, abort)
+		if err != nil {
+			return nil, err
+		}
+		if granted != nil {
+			return granted, nil
+		}
+		// Waiter was dropped without a lease; re-acquire.
+	}
+}
+
+func (b *Broker) waitLocal(wt *Waiter, deadline time.Time, abort <-chan struct{}) (*Lease, error) {
+	tick := time.NewTicker(5 * time.Second)
+	defer tick.Stop()
+	var expire <-chan time.Time
+	if !deadline.IsZero() {
+		t := time.NewTimer(time.Until(deadline))
+		defer t.Stop()
+		expire = t.C
+	}
+	for {
+		select {
+		case <-wt.ch:
+			b.mu.Lock()
+			l := wt.lease
+			if l != nil {
+				l.Claimed = true
+			}
+			delete(b.waiters, wt.ID)
+			b.mu.Unlock()
+			return l, nil
+		case <-tick.C:
+			// Local waiters "poll" by construction — keep them fresh so
+			// the reaper doesn't drop them.
+			b.mu.Lock()
+			wt.LastPoll = time.Now()
+			b.mu.Unlock()
+		case <-expire:
+			b.dropWaiter(wt)
+			return nil, ErrWaitTimeout
+		case <-abort:
+			b.dropWaiter(wt)
+			return nil, errors.New("client went away while queued")
+		}
+	}
+}
+
+// dropWaiter removes a waiter that is giving up; if a lease was granted in
+// the race window, it is released so the queue keeps moving.
+func (b *Broker) dropWaiter(wt *Waiter) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	delete(b.waiters, wt.ID)
+	q := b.queues[wt.Serial]
+	for i, x := range q {
+		if x == wt {
+			b.queues[wt.Serial] = append(q[:i], q[i+1:]...)
+			break
+		}
+	}
+	if len(b.queues[wt.Serial]) == 0 {
+		delete(b.queues, wt.Serial)
+	}
+	if wt.lease != nil && b.leases[wt.Serial] == wt.lease {
+		b.expireLocked(wt.lease, "abandoned")
+	}
+}
+
+// TouchLease and EndLeaseCommand are in-process lease upkeep for the proxy.
+func (b *Broker) TouchLease(id string) {
+	b.mu.Lock()
+	if l := b.leaseByIDLocked(id); l != nil {
+		now := time.Now()
+		l.LastBeat, l.LastActive, l.Claimed = now, now, true
+	}
+	b.mu.Unlock()
+}
+
+func (b *Broker) EndLeaseCommand(id string) {
+	b.mu.Lock()
+	if l := b.leaseByIDLocked(id); l != nil {
+		now := time.Now()
+		if l.Running > 0 {
+			l.Running--
+		}
+		l.LastBeat, l.LastActive, l.Claimed = now, now, true
+	}
+	b.mu.Unlock()
 }
 
 func (b *Broker) explicitTTL(req AcquireReq) time.Duration {
@@ -363,7 +488,7 @@ func (b *Broker) handleState(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (b *Broker) handleDevices(w http.ResponseWriter, _ *http.Request) {
-	devs, err := ListDevices(b.cfg.RealADB)
+	devs, err := ListDevices(b.cfg.RealADB, b.cfg.ClientServerPort())
 	resp := DevicesResp{}
 	if err != nil {
 		resp.Error = err.Error()
@@ -440,6 +565,7 @@ func (b *Broker) grantNextLocked(serial string) {
 	for _, wt := range q {
 		if wt.lease == nil && now.Sub(wt.LastPoll) > staleWaiter {
 			delete(b.waiters, wt.ID)
+			close(wt.ch) // wake any blocked local waiter; lease==nil signals the drop
 			log.Printf("dropped stale waiter %s for %s", wt.Holder, serial)
 			continue
 		}

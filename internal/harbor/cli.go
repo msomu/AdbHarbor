@@ -3,6 +3,7 @@ package harbor
 import (
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -224,10 +225,21 @@ func CmdDoctor() error {
 		fmt.Println("  daemon:      running on", SocketPath())
 	}
 
+	if cfg.ProxyEnabled {
+		if c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", cfg.ProxyPort), time.Second); err == nil {
+			c.Close()
+			fmt.Printf("  adb port:    %d brokered by harbor (real server on %d)\n", cfg.ProxyPort, cfg.AdbServerPort)
+		} else {
+			fmt.Printf("  adb port:    %d NOT listening — proxy down, clients bypass the broker\n", cfg.ProxyPort)
+		}
+	} else {
+		fmt.Println("  adb port:    proxy disabled (only PATH-shim commands are brokered)")
+	}
+
 	fmt.Println("  session:    ", DetectSession(cfg))
 
 	if real != "" {
-		if devs, err := ListDevices(real); err == nil {
+		if devs, err := ListDevices(real, cfg.ClientServerPort()); err == nil {
 			fmt.Printf("  devices:     %d connected\n", len(devs))
 		}
 	}

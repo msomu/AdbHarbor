@@ -45,11 +45,16 @@ func CmdInstall(args []string) error {
 		return fmt.Errorf("symlink adb: %w", err)
 	}
 
-	// Discover the real adb BEFORE our bin dir joins PATH.
+	// Keep an already-pinned real adb (a reinstall must not silently switch
+	// binaries); discover only when unset or gone.
 	cfg := LoadConfig()
-	real, err := DiscoverRealADB()
-	if err != nil {
-		return fmt.Errorf("%w\ninstall the Android platform-tools first, then re-run `adbharbor install`", err)
+	real := cfg.RealADB
+	if real == "" || !isExecutable(real) || isSelf(real) {
+		var err error
+		real, err = DiscoverRealADB()
+		if err != nil {
+			return fmt.Errorf("%w\ninstall the Android platform-tools first, then re-run `adbharbor install`", err)
+		}
 	}
 	cfg.RealADB = real
 	if err := cfg.Save(); err != nil {
@@ -160,6 +165,11 @@ func stripRC(rc string) error {
 		}
 	}
 	return os.WriteFile(rc, []byte(strings.Join(out, "\n")), 0o644)
+}
+
+func isExecutable(p string) bool {
+	info, err := os.Stat(p)
+	return err == nil && !info.IsDir() && info.Mode()&0o111 != 0
 }
 
 func copyFile(src, dst string, mode os.FileMode) error {

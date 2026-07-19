@@ -5,10 +5,16 @@ description: Use when running adb commands, Android device automation, or app in
 
 # AdbHarbor: adb is brokered on this machine
 
-Every `adb` command on this machine goes through AdbHarbor, a lock broker
+ALL device access on this machine goes through AdbHarbor, a lock broker
 that gives each agent session exclusive access to one device at a time.
-You do not need to do anything special — run `adb` normally. This skill
-explains the behaviors you will observe and how to react.
+The harbor owns the ADB server port (5037), so every client is brokered —
+`adb` at any path, Maestro, Android Studio, CI runners — not just shell
+commands. You do not need to do anything special — run `adb` normally.
+
+Read-only commands (`getprop`, `dumpsys`, `pm list`, `settings get`, ...)
+are lease-exempt: they always run instantly, even on a busy device. Only
+device-mutating commands (install, am/input, push, logcat, shell scripts)
+take the lease.
 
 ## What you'll observe
 
@@ -23,8 +29,9 @@ explains the behaviors you will observe and how to react.
   test sequence cannot be interleaved by another agent. The lease lingers
   ~60s after your last adb command, then the device passes to the next
   session in the queue.
-- If the app on the device changed under you anyway, another actor bypassed
-  the broker (e.g. Android Studio) — report it, don't force-release.
+- Automation daemons (e.g. DroidRunner CI jobs) are brokered too: while a
+  job runs its device shows as held (session like `bun-...`) and your
+  commands queue behind it — this is normal, wait or pick another device.
 
 ## Commands
 

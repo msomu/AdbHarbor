@@ -3,6 +3,7 @@ package harbor
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -17,13 +18,19 @@ type Device struct {
 }
 
 // ListDevices runs `adb devices -l` against the real adb and parses it.
-func ListDevices(realADB string) ([]Device, error) {
+// serverPort > 0 pins ANDROID_ADB_SERVER_PORT (used when the harbor proxy
+// owns the default port and the real server lives elsewhere).
+func ListDevices(realADB string, serverPort int) ([]Device, error) {
 	if realADB == "" {
 		return nil, fmt.Errorf("real adb path not configured; run `adbharbor install`")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, realADB, "devices", "-l").Output()
+	cmd := exec.CommandContext(ctx, realADB, "devices", "-l")
+	if serverPort > 0 {
+		cmd.Env = envWithServerPort(os.Environ(), serverPort)
+	}
+	out, err := cmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("adb devices: %w", err)
 	}

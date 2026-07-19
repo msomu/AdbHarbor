@@ -27,18 +27,30 @@ func DetectSession(cfg *Config) string {
 		}
 		return "claude-" + sanitizeKey(v)
 	}
-	pid := os.Getppid()
-	for depth := 0; depth < 25 && pid > 1; depth++ {
-		name, ppid, ok := psInfo(pid)
+	return DetectSessionForPID(os.Getppid(), cfg)
+}
+
+// DetectSessionForPID walks the process tree from pid (inclusive) looking
+// for a known agent process; used both by the shim (from its parent) and by
+// the ADB server proxy (from the connecting client's pid).
+func DetectSessionForPID(pid int, cfg *Config) string {
+	cur := pid
+	for depth := 0; depth < 25 && cur > 1; depth++ {
+		name, ppid, ok := psInfo(cur)
 		if !ok {
 			break
 		}
 		if matchesAgent(name, cfg.AgentProcs) {
-			return fmt.Sprintf("%s-%d", name, pid)
+			return fmt.Sprintf("%s-%d", name, cur)
 		}
-		pid = ppid
+		cur = ppid
 	}
-	return fmt.Sprintf("shell-%d", os.Getppid())
+	// No agent ancestor: key on the starting process itself, which is
+	// stable for its lifetime (a shell, a gradle daemon, ...).
+	if name, _, ok := psInfo(pid); ok {
+		return fmt.Sprintf("%s-%d", name, pid)
+	}
+	return fmt.Sprintf("pid-%d", pid)
 }
 
 // HolderDesc is the human-readable owner label shown to other sessions.
