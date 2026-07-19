@@ -9,6 +9,8 @@ type ADBInvocation struct {
 	UseUSB      bool
 	UseEmulator bool
 	Command     string
+	// Rest holds the arguments after Command (e.g. the shell command line).
+	Rest []string
 }
 
 // Global adb flags that consume a value.
@@ -31,6 +33,7 @@ func ParseInvocation(args []string) ADBInvocation {
 		a := args[i]
 		if !strings.HasPrefix(a, "-") {
 			inv.Command = a
+			inv.Rest = args[i+1:]
 			break
 		}
 		switch {
@@ -53,4 +56,23 @@ func ParseInvocation(args []string) ADBInvocation {
 
 func (inv ADBInvocation) NeedsDevice() bool {
 	return !devicelessCmds[inv.Command]
+}
+
+// IsExemptReadOnly mirrors the proxy's read-only exemption for shim-side
+// shell/exec-out invocations, so `adb shell getprop ...` is instant at both
+// layers even while another session holds the device.
+func (inv ADBInvocation) IsExemptReadOnly(prefixes []string) bool {
+	if inv.Command != "shell" && inv.Command != "exec-out" {
+		return false
+	}
+	cmd := strings.TrimSpace(strings.Join(inv.Rest, " "))
+	if cmd == "" {
+		return false // interactive shell
+	}
+	for _, p := range prefixes {
+		if strings.HasPrefix(cmd, p) {
+			return true
+		}
+	}
+	return false
 }

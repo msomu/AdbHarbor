@@ -42,7 +42,7 @@ func RunShim(args []string) int {
 	}
 
 	inv := ParseInvocation(args)
-	if !inv.NeedsDevice() {
+	if !inv.NeedsDevice() || inv.IsExemptReadOnly(cfg.ExemptShell) {
 		return execReal(real, args, execEnv)
 	}
 
