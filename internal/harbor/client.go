@@ -164,6 +164,12 @@ func AcquireBlocking(req AcquireReq, waitSec int, progress func(msg string)) (st
 func Heartbeat(leaseID string) { call("/v1/heartbeat", LeaseRef{LeaseID: leaseID}, nil, 5*time.Second) }
 func EndCommand(leaseID string) { call("/v1/end", LeaseRef{LeaseID: leaseID}, nil, 5*time.Second) }
 
+func AcquireAny(req AcquireAnyReq) (AcquireAnyResp, error) {
+	var resp AcquireAnyResp
+	err := call("/v1/acquire-any", req, &resp, 15*time.Second)
+	return resp, err
+}
+
 func Release(req ReleaseReq) (ReleaseResp, error) {
 	var resp ReleaseResp
 	err := call("/v1/release", req, &resp, 10*time.Second)

@@ -45,9 +45,13 @@ adbharbor release -s SERIAL             # release your own lease early
 
 ## Rules
 
-1. **Prefer a free device.** Before a long task on a shared machine, run
-   `adbharbor devices` and pick a serial that shows `free` (respecting any
-   device policy in your instructions). Pin it with `adb -s SERIAL …`.
+1. **Prefer a free device — atomically.** Before a long task, run
+   `S=$(adbharbor acquire --any --ttl 20m)` — the broker picks a free
+   device, leases it to you, and prints its serial (stdout only). Pin every
+   command with `adb -s $S …` and `adbharbor release -s $S` when done.
+   Exit 75 = the whole fleet is busy. It's sticky: asking again returns
+   the device you already hold. (Manual alternative: `adbharbor devices`,
+   pick a `free` serial — but two agents can race; `--any` cannot.)
 2. **Never `adbharbor release --force`** a device that another session
    holds unless its holder is provably dead — force-release yanks the
    device mid-command from the other agent. Crashed holders are reclaimed

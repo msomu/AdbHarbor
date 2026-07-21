@@ -41,6 +41,24 @@ type LeaseRef struct {
 	LeaseID string `json:"lease_id"`
 }
 
+// AcquireAnyReq asks the broker to atomically pick and lease any free
+// device matching the constraints.
+type AcquireAnyReq struct {
+	Session  string `json:"session"`
+	Holder   string `json:"holder"`
+	PID      int    `json:"pid"`
+	TTLSec   int    `json:"ttl_sec,omitempty"`
+	USB      bool   `json:"usb,omitempty"`
+	Emulator bool   `json:"emulator,omitempty"`
+}
+
+type AcquireAnyResp struct {
+	Granted bool   `json:"granted"`
+	Serial  string `json:"serial,omitempty"`
+	LeaseID string `json:"lease_id,omitempty"`
+	Message string `json:"message,omitempty"`
+}
+
 type ReleaseReq struct {
 	Serial  string `json:"serial,omitempty"`
 	LeaseID string `json:"lease_id,omitempty"`

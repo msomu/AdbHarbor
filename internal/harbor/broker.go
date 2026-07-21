@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -120,6 +121,7 @@ func RunDaemon() error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/ping", b.handlePing)
 	mux.HandleFunc("/v1/acquire", b.handleAcquire)
+	mux.HandleFunc("/v1/acquire-any", b.handleAcquireAny)
 	mux.HandleFunc("/v1/wait", b.handleWait)
 	mux.HandleFunc("/v1/heartbeat", b.handleHeartbeat)
 	mux.HandleFunc("/v1/end", b.handleEnd)
@@ -197,6 +199,74 @@ func (b *Broker) handleAcquire(w http.ResponseWriter, r *http.Request) {
 	}
 	b.mu.Unlock()
 	writeJSON(w, resp)
+}
+
+// handleAcquireAny atomically picks a free device matching the constraints
+// and grants an explicit lease on it — the "route to the next free phone"
+// primitive. Never waits: if every matching device is busy, the caller gets
+// the holder list and decides whether to queue on one or retry.
+func (b *Broker) handleAcquireAny(w http.ResponseWriter, r *http.Request) {
+	var req AcquireAnyReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Session == "" {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	// Device inventory comes from adb — do it before taking the lock.
+	devs, err := ListDevices(b.config().RealADB, b.config().ClientServerPort())
+	if err != nil {
+		writeJSON(w, AcquireAnyResp{Message: err.Error()})
+		return
+	}
+	now := time.Now()
+	acq := AcquireReq{
+		Session: req.Session, Holder: req.Holder, PID: req.PID,
+		TTLSec: req.TTLSec, Explicit: true,
+	}
+	idle := time.Duration(b.config().IdleTTLSec) * time.Second
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	// Sticky: a session that already holds a device keeps getting it.
+	for _, l := range b.leases {
+		if l.Session == req.Session {
+			l.LastActive, l.LastBeat, l.Claimed = now, now, true
+			l.Explicit = true
+			l.ExpiresAt = now.Add(b.explicitTTL(acq))
+			writeJSON(w, AcquireAnyResp{Granted: true, Serial: l.Serial, LeaseID: l.ID})
+			return
+		}
+	}
+	var busy []string
+	for _, d := range devs {
+		if d.State != "device" {
+			continue
+		}
+		isEmu := strings.HasPrefix(d.Serial, "emulator-")
+		if req.USB && (isEmu || !d.USB) {
+			continue
+		}
+		if req.Emulator && !isEmu {
+			continue
+		}
+		if l := b.leases[d.Serial]; l != nil {
+			busy = append(busy, fmt.Sprintf("%s (held by %s)", d.Serial, l.Holder))
+			continue
+		}
+		if b.cleaning[d.Serial] {
+			busy = append(busy, d.Serial+" (session cleanup)")
+			continue
+		}
+		acq.Serial = d.Serial
+		l := b.grantLocked(acq, now, idle)
+		writeJSON(w, AcquireAnyResp{Granted: true, Serial: d.Serial, LeaseID: l.ID})
+		return
+	}
+	msg := "no matching device connected"
+	if len(busy) > 0 {
+		msg = "all matching devices busy: " + strings.Join(busy, ", ")
+	}
+	writeJSON(w, AcquireAnyResp{Message: msg})
 }
 
 // acquireLocked grants (or renews) a lease, or enqueues a waiter when the

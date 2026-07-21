@@ -22,4 +22,7 @@ serializes device access between concurrent agents. Run adb normally.
   within ~2 minutes.
 - For a long exclusive run: `adbharbor acquire -s SERIAL --ttl 30m`, then
   `adbharbor release -s SERIAL` when done.
+- Multiple devices connected? Let the broker route you to a free one:
+  `S=$(adbharbor acquire --any --ttl 20m)` prints the leased serial; use
+  `adb -s $S ...` and release when done. Exit 75 = whole fleet busy.
 ```

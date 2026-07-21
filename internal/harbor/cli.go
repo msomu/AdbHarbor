@@ -107,14 +107,20 @@ func CmdWho(args []string) error {
 
 func CmdAcquire(args []string) error {
 	fs := flag.NewFlagSet("acquire", flag.ContinueOnError)
-	serial := fs.String("s", "", "device serial (required)")
+	serial := fs.String("s", "", "device serial")
+	any := fs.Bool("any", false, "lease any free device (prints its serial on stdout)")
+	usb := fs.Bool("usb", false, "with --any: only USB devices")
+	emulator := fs.Bool("emulator", false, "with --any: only emulators")
 	ttl := fs.Duration("ttl", 0, "how long to hold the lease (default from config)")
 	sessionFlag := fs.String("session", "", "session key (default: auto-detected)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	if *any {
+		return cmdAcquireAny(*usb, *emulator, *ttl, *sessionFlag)
+	}
 	if *serial == "" {
-		return fmt.Errorf("acquire: -s SERIAL is required")
+		return fmt.Errorf("acquire: -s SERIAL or --any is required")
 	}
 	if err := EnsureDaemon(); err != nil {
 		return err
@@ -145,6 +151,45 @@ func CmdAcquire(args []string) error {
 	fmt.Printf("acquired %s for session %s (lease %s, expires in %s)\n",
 		*serial, session, leaseID, (time.Duration(ttlSec) * time.Second))
 	fmt.Printf("release with: adbharbor release -s %s\n", *serial)
+	return nil
+}
+
+// cmdAcquireAny leases any free matching device. The chosen serial is the
+// ONLY thing printed to stdout, so scripts and agents can do:
+//
+//	S=$(adbharbor acquire --any) && adb -s "$S" ...
+func cmdAcquireAny(usb, emulator bool, ttl time.Duration, sessionFlag string) error {
+	if err := EnsureDaemon(); err != nil {
+		return err
+	}
+	cfg := LoadConfig()
+	session := sessionFlag
+	if session == "" {
+		session = DetectSession(cfg)
+	}
+	resp, err := AcquireAny(AcquireAnyReq{
+		Session: session,
+		Holder:  HolderDesc(session),
+		PID:     os.Getpid(),
+		TTLSec:  int(ttl.Seconds()),
+		USB:     usb,
+		Emulator: emulator,
+	})
+	if err != nil {
+		return err
+	}
+	if !resp.Granted {
+		fmt.Fprintf(os.Stderr, "adbharbor: %s\n", resp.Message)
+		fmt.Fprintln(os.Stderr, "adbharbor: retry later, or queue on a specific device with plain `adb -s SERIAL ...`")
+		os.Exit(75)
+	}
+	ttlSec := int(ttl.Seconds())
+	if ttlSec == 0 {
+		ttlSec = cfg.ExplicitTTLSec
+	}
+	fmt.Fprintf(os.Stderr, "adbharbor: leased %s for session %s (expires in %s; release with: adbharbor release -s %s)\n",
+		resp.Serial, session, time.Duration(ttlSec)*time.Second, resp.Serial)
+	fmt.Println(resp.Serial)
 	return nil
 }
 

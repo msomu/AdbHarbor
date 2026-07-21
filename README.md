@@ -50,6 +50,10 @@ adbharbor devices              # devices + who holds them + queue depth
 adbharbor status               # all leases and queues
 adbharbor who -s SERIAL        # who holds one device
 adbharbor acquire -s SERIAL --ttl 30m   # hold a device explicitly
+adbharbor acquire --any [--usb|--emulator] --ttl 20m
+                               # lease ANY free device — prints its serial on
+                               # stdout (exit 75 if all busy); atomic, so two
+                               # agents asking simultaneously get different devices
 adbharbor release -s SERIAL [--force]
 adbharbor cleanup [on|off]     # uninstall-on-release of session apps (default: off)
 adbharbor doctor               # check shim, real adb, daemon, session detection

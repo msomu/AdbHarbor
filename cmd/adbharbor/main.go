@@ -21,6 +21,9 @@ Usage:
   adbharbor who -s SERIAL       Show who holds a device
   adbharbor acquire -s SERIAL [--ttl 15m] [--session NAME]
                                 Hold a device explicitly (until release or TTL)
+  adbharbor acquire --any [--usb|--emulator] [--ttl 15m]
+                                Lease ANY free device; prints its serial on
+                                stdout (exit 75 if all are busy)
   adbharbor release -s SERIAL [--force]
                                 Release a lease (--force releases someone else's)
   adbharbor cleanup [on|off]    Show or toggle uninstall-on-release of
