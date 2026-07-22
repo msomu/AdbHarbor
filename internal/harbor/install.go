@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/msomu/AdbHarbor/skills"
 )
 
 const rcBegin = "# >>> adbharbor >>>"
@@ -17,9 +19,16 @@ const rcEnd = "# <<< adbharbor <<<"
 //  4. prepend ~/.adbharbor/bin to PATH via the shell rc
 func CmdInstall(args []string) error {
 	noRC := false
+	noSkill := false
+	forceSkill := false
 	for _, a := range args {
-		if a == "--no-rc" {
+		switch a {
+		case "--no-rc":
 			noRC = true
+		case "--no-skill":
+			noSkill = true
+		case "--force-skill":
+			forceSkill = true
 		}
 	}
 	if err := EnsureDir(); err != nil {
@@ -69,12 +78,23 @@ func CmdInstall(args []string) error {
 		}
 	}
 
+	skillPath, skillNote := "", ""
+	if !noSkill {
+		skillPath, skillNote = installSkill(forceSkill)
+	}
+
 	fmt.Printf("adbharbor %s installed\n", Version)
 	fmt.Printf("  shim:      %s -> adbharbor\n", link)
 	fmt.Printf("  real adb:  %s\n", real)
 	fmt.Printf("  config:    %s\n", ConfigPath())
 	if rcPath != "" {
 		fmt.Printf("  PATH:      patched %s (open a new shell or `exec zsh` to activate)\n", rcPath)
+	}
+	if skillPath != "" {
+		fmt.Printf("  skill:     %s\n", skillPath)
+	}
+	if skillNote != "" {
+		fmt.Printf("  skill:     %s\n", skillNote)
 	}
 	fmt.Println("\nEvery `adb` command now goes through the harbor: device-targeted")
 	fmt.Println("commands take an exclusive per-session lease and queue when busy.")
@@ -92,8 +112,77 @@ func CmdUninstall() error {
 			return err
 		}
 	}
+	if removed := uninstallSkill(); removed != "" {
+		fmt.Println("removed skill", removed)
+	}
 	fmt.Println("adbharbor shim removed; data dir kept at", Dir())
 	return nil
+}
+
+// skillStamp marks a skill directory as installed by us, so uninstall and
+// upgrade only ever touch our own copy and never a hand-written one.
+const skillStamp = ".adbharbor-version"
+
+func skillDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".claude", "skills", "adbharbor")
+}
+
+// installSkill places the bundled agent skill in ~/.claude/skills.
+//
+// This has to happen here rather than in packaging: Homebrew runs formula
+// installs in a sandbox that forbids writing to $HOME, so `brew install`
+// can never deliver a skill. `adbharbor install` is already a required
+// second step, which makes it the one place a default install can teach
+// agents what a queued adb command means.
+//
+// Never fatal: a missing or unwritable ~/.claude just means this machine
+// runs no Claude Code, which is no reason to fail the shim install.
+func installSkill(force bool) (path, note string) {
+	dir := skillDir()
+	if dir == "" {
+		return "", ""
+	}
+	// Only for machines that already run Claude Code — don't conjure a
+	// config directory for someone who has none.
+	claude := filepath.Dir(filepath.Dir(dir))
+	if _, err := os.Stat(claude); err != nil {
+		return "", ""
+	}
+	dst := filepath.Join(dir, "SKILL.md")
+	if _, err := os.Stat(dst); err == nil && !force {
+		if _, err := os.Stat(filepath.Join(dir, skillStamp)); err != nil {
+			return "", dst + " exists and was not installed by us — left alone (--force-skill to replace)"
+		}
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", "could not create " + dir + ": " + err.Error()
+	}
+	if err := os.WriteFile(dst, skills.ClaudeSkill, 0o644); err != nil {
+		return "", "could not write " + dst + ": " + err.Error()
+	}
+	if err := os.WriteFile(filepath.Join(dir, skillStamp), []byte(Version+"\n"), 0o644); err != nil {
+		return dst, "installed, but could not stamp version: " + err.Error()
+	}
+	return dst, ""
+}
+
+// uninstallSkill removes the skill only when our stamp is present.
+func uninstallSkill() string {
+	dir := skillDir()
+	if dir == "" {
+		return ""
+	}
+	if _, err := os.Stat(filepath.Join(dir, skillStamp)); err != nil {
+		return ""
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		return ""
+	}
+	return dir
 }
 
 func stopQuietly() error {
