@@ -1,12 +1,14 @@
 package harbor
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 )
 
 // DetectSession derives a stable session key for the calling agent.
@@ -158,6 +160,49 @@ func isEnvName(s string) bool {
 		}
 	}
 	return true
+}
+
+// OwnerPIDFromSession extracts the process a tree-derived session key is
+// named for ("claude-97333" -> 97333), which is the agent process itself:
+// long-lived, and gone exactly when the agent is. Explicit keys set through
+// ADB_HARBOR_SESSION carry no pid and return 0, meaning "no liveness signal
+// — fall back to the TTL".
+func OwnerPIDFromSession(session string) int {
+	i := strings.LastIndex(session, "-")
+	if i < 0 {
+		return 0
+	}
+	pid, err := strconv.Atoi(session[i+1:])
+	if err != nil || pid <= 1 {
+		return 0
+	}
+	return pid
+}
+
+// processAlive reports whether pid still exists. Signal 0 performs the
+// permission and existence checks without delivering anything; EPERM means
+// the process is there but owned by someone else, which still counts as
+// alive. A zero pid means we have no signal, so nothing is concluded and
+// the answer is yes.
+func processAlive(pid int) bool {
+	if pid <= 0 {
+		return true
+	}
+	if err := syscall.Kill(pid, 0); err != nil && !errors.Is(err, syscall.EPERM) {
+		return false
+	}
+	// A zombie still answers signal 0 — it has exited but its parent has
+	// not reaped it. It will never release a lease, so for our purposes it
+	// is dead.
+	return !processIsZombie(pid)
+}
+
+func processIsZombie(pid int) bool {
+	out, err := exec.Command("ps", "-o", "state=", "-p", strconv.Itoa(pid)).Output()
+	if err != nil {
+		return false
+	}
+	return strings.HasPrefix(strings.TrimSpace(string(out)), "Z")
 }
 
 // HolderDesc is the human-readable owner label shown to other sessions.

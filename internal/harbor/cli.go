@@ -54,6 +54,33 @@ func runningSuffix(n int) string {
 	return ""
 }
 
+// sharedRuntimes are process names that commonly host or wrap more than one
+// agent. Keying an identity on one of them is the silent failure mode of
+// auto-detection: every agent underneath collapses into a single session, so
+// they share one lease and stop being isolated from each other.
+var sharedRuntimes = []string{"node", "bun", "deno", "java", "gradle", "python", "python3"}
+
+// sharedIdentityWarning flags an identity that is probably shared with other
+// agents. It cannot be certain — one bun process may well host exactly one
+// agent — so it reports what the key is pinned to and how to make it
+// explicit, rather than claiming a fault.
+func sharedIdentityWarning(session, source string) string {
+	if source != "process tree" {
+		return ""
+	}
+	name := session
+	if i := strings.LastIndex(session, "-"); i > 0 {
+		name = session[:i]
+	}
+	for _, r := range sharedRuntimes {
+		if name == r {
+			return fmt.Sprintf("note: keyed on a shared `%s` process — every agent under it\n"+
+				"                shares one lease. Export ADB_HARBOR_SESSION to separate them.", name)
+		}
+	}
+	return ""
+}
+
 // youSuffix marks the rows belonging to the caller. Without it a session
 // reading this output cannot tell its own lease from a stranger's, and an
 // agent blocked behind what is actually its own lingering lease has no way
@@ -383,7 +410,11 @@ func CmdDoctor() error {
 		fmt.Println("  adb port:    proxy disabled (only PATH-shim commands are brokered)")
 	}
 
-	fmt.Println("  session:    ", DetectSession(cfg))
+	session, source := DetectSessionSource(cfg)
+	fmt.Printf("  session:     %s (%s)\n", session, source)
+	if warn := sharedIdentityWarning(session, source); warn != "" {
+		fmt.Println("               ", warn)
+	}
 
 	if real != "" {
 		if devs, err := ListDevices(real, cfg.ClientServerPort()); err == nil {

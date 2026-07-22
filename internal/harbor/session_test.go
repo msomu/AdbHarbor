@@ -103,6 +103,26 @@ func TestHelperIdle(t *testing.T) {
 	time.Sleep(10 * time.Second)
 }
 
+// killHelper kills a helper and waits until liveness reports it gone. It is
+// deliberately left unreaped, so this also covers the zombie case: the pid
+// still answers signal 0 but the agent is finished either way.
+func killHelper(t *testing.T, pid int) {
+	t.Helper()
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		t.Fatalf("find helper %d: %v", pid, err)
+	}
+	_ = proc.Kill()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if !processAlive(pid) {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("helper %d still reported alive after kill", pid)
+}
+
 func TestClassifyClientPrefersEnvOverProcessTree(t *testing.T) {
 	pid := startHelper(t, "ADB_HARBOR_SESSION=agent-6")
 	session, source, observer := classifyClient(pid, DefaultConfig())

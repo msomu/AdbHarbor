@@ -49,7 +49,7 @@ type Config struct {
 
 func DefaultConfig() *Config {
 	return &Config{
-		IdleTTLSec:     300,
+		IdleTTLSec:     30,
 		WaitSec:        600,
 		ExplicitTTLSec: 900,
 		AgentProcs: []string{

@@ -44,6 +44,11 @@ type Lease struct {
 	// Claimed is false for a lease granted from the queue until its owner
 	// shows a sign of life (wait pickup, heartbeat, or command end).
 	Claimed bool `json:"claimed"`
+	// OwnerPID is the agent process the session is named for, when the
+	// session key was derived from the process tree. A lease outlives the
+	// command that took it, so this is the only handle on whether the agent
+	// that owns it still exists.
+	OwnerPID int `json:"owner_pid,omitempty"`
 	// Baseline is the device's package list at grant time, used by session
 	// cleanup to uninstall only what this session installed.
 	Baseline []string `json:"pkg_baseline,omitempty"`
@@ -431,7 +436,7 @@ func (b *Broker) explicitTTL(req AcquireReq) time.Duration {
 func (b *Broker) grantLocked(req AcquireReq, now time.Time, idle time.Duration) *Lease {
 	l := &Lease{
 		ID: b.newID("lease"), Serial: req.Serial, Session: req.Session,
-		Holder: req.Holder, PID: req.PID,
+		Holder: req.Holder, PID: req.PID, OwnerPID: OwnerPIDFromSession(req.Session),
 		AcquiredAt: now, LastActive: now, LastBeat: now,
 		IdleTTL: idle, Explicit: req.Explicit, Claimed: true,
 	}
@@ -694,7 +699,7 @@ func (b *Broker) grantNextLocked(serial string, now time.Time) {
 	}
 	l := &Lease{
 		ID: b.newID("lease"), Serial: serial, Session: head.Session,
-		Holder: head.Holder,
+		Holder: head.Holder, OwnerPID: OwnerPIDFromSession(head.Session),
 		AcquiredAt: now, LastActive: now, LastBeat: now,
 		IdleTTL: idle,
 	}
@@ -748,6 +753,16 @@ func (b *Broker) sweep(now time.Time) {
 	for _, l := range b.leases {
 		if !l.Claimed && now.Sub(l.AcquiredAt) > unclaimedGrace {
 			b.expireLocked(l, now, "unclaimed")
+			continue
+		}
+		// An agent that died never gets to release. Waiting out its TTL
+		// strands the device for up to explicit_ttl_seconds — so once no
+		// command is in flight and the owning process is gone, take the
+		// device back. This is what makes an explicit `acquire` safe to
+		// give a long TTL, and it needs nothing from the agent: no exit
+		// hook, which a killed process would not run anyway.
+		if l.Running == 0 && !processAlive(l.OwnerPID) {
+			b.expireLocked(l, now, "owner-gone")
 			continue
 		}
 		if l.Running > 0 && now.Sub(l.LastBeat) > orphanBeat {

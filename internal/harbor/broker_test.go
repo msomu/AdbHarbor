@@ -1,6 +1,8 @@
 package harbor
 
 import (
+	"fmt"
+	"os"
 	"testing"
 	"time"
 )
@@ -123,32 +125,36 @@ func TestWaiterGetsDeviceOnlyAfterLingerExpires(t *testing.T) {
 	}
 }
 
-// Stock config makes that linger five minutes: on a default install the
-// next agent waits 300s for a device nobody is using. This test states the
-// cost so a change to the default is a deliberate act.
-func TestDefaultIdleTTLCostsFiveMinutesPerHandoff(t *testing.T) {
+// The linger is what a waiting agent pays for the previous agent's
+// think-time, so the default bounds the cost of every handoff. This test
+// states that cost in code: raising it is a deliberate act, not a drift.
+func TestDefaultIdleTTLBoundsHandoffCost(t *testing.T) {
 	cfg := DefaultConfig()
-	if got := time.Duration(cfg.IdleTTLSec) * time.Second; got != 5*time.Minute {
-		t.Errorf("default idle TTL = %s, want 5m (update this test deliberately)", got)
+	idle := time.Duration(cfg.IdleTTLSec) * time.Second
+	if idle != 30*time.Second {
+		t.Errorf("default idle TTL = %s, want 30s (update this test deliberately)", idle)
 	}
 
 	b := testBroker(t, cfg)
 	t0 := time.Unix(1700000000, 0)
-	idle := time.Duration(cfg.IdleTTLSec) * time.Second
 
 	leaseA, _ := b.acquireAt(command("agent-a"), t0, idle)
-	b.acquireAt(command("agent-b"), t0.Add(time.Second), idle)
+	_, waitB := b.acquireAt(command("agent-b"), t0.Add(time.Second), idle)
 	b.EndLeaseCommand(leaseA.ID)
 	b.mu.Lock()
 	b.leases[dev].LastActive = t0.Add(2 * time.Second)
 	b.mu.Unlock()
 
-	b.sweep(t0.Add(4 * time.Minute))
-	b.mu.Lock()
-	held := b.leases[dev].Session
-	b.mu.Unlock()
-	if held != "agent-a" {
-		t.Fatalf("device changed hands after 4m, holder = %s", held)
+	// Still owned one second before the linger is up...
+	b.sweep(t0.Add(31 * time.Second))
+	if got := b.holderAt(); got != "agent-a" {
+		t.Fatalf("holder at 31s = %q, want agent-a", got)
+	}
+	// ...and handed over a second after.
+	b.poll(waitB, t0.Add(32*time.Second))
+	b.sweep(t0.Add(33 * time.Second))
+	if got := b.holderAt(); got != "agent-b" {
+		t.Fatalf("holder at 33s = %q, want agent-b", got)
 	}
 }
 
@@ -319,5 +325,119 @@ func TestOrphanedCommandsStopPinningTheDevice(t *testing.T) {
 	b.mu.Unlock()
 	if still {
 		t.Error("device stayed pinned by a dead client")
+	}
+}
+
+// An agent that dies never releases. Nothing in the agent can be relied on
+// to notice — a killed process runs no exit hook — so the broker checks
+// whether the owning process still exists.
+
+func TestLeaseReclaimedWhenOwningAgentDies(t *testing.T) {
+	b := testBroker(t, DefaultConfig())
+	t0 := time.Unix(1700000000, 0)
+
+	dead := startHelper(t)
+	killHelper(t, dead)
+
+	req := command(fmt.Sprintf("claude-%d", dead))
+	req.Explicit, req.TTLSec = true, 3600 // a long explicit lease
+	b.mu.Lock()
+	l := b.grantLocked(req, t0, 30*time.Second)
+	l.Running = 0
+	b.mu.Unlock()
+
+	if l.OwnerPID != dead {
+		t.Fatalf("OwnerPID = %d, want %d", l.OwnerPID, dead)
+	}
+	// Far inside the explicit TTL: only the dead owner can free this.
+	b.sweep(t0.Add(time.Minute))
+	if got := b.holderAt(); got != "" {
+		t.Fatalf("device still held by %q after its agent died", got)
+	}
+}
+
+func TestLeaseSurvivesWhileOwnerIsAlive(t *testing.T) {
+	b := testBroker(t, DefaultConfig())
+	t0 := time.Unix(1700000000, 0)
+
+	alive := fmt.Sprintf("claude-%d", os.Getpid())
+	b.mu.Lock()
+	l := b.grantLocked(command(alive), t0, 30*time.Second)
+	l.Running, l.LastActive = 0, t0
+	b.mu.Unlock()
+
+	b.sweep(t0.Add(10 * time.Second))
+	if got := b.holderAt(); got != alive {
+		t.Fatalf("holder = %q, want %q — a live agent lost its lease", got, alive)
+	}
+}
+
+// A dead owner must not pull the device out from under a command that is
+// still running against it.
+func TestDeadOwnerDoesNotInterruptRunningCommand(t *testing.T) {
+	b := testBroker(t, DefaultConfig())
+	t0 := time.Unix(1700000000, 0)
+
+	dead := startHelper(t)
+	killHelper(t, dead)
+
+	b.mu.Lock()
+	l := b.grantLocked(command(fmt.Sprintf("claude-%d", dead)), t0, 30*time.Second)
+	l.Running, l.LastBeat = 1, t0
+	b.mu.Unlock()
+
+	b.sweep(t0.Add(10 * time.Second))
+	if b.holderAt() == "" {
+		t.Fatal("device released while a command was still running on it")
+	}
+}
+
+// An explicit ADB_HARBOR_SESSION carries no pid, so there is no liveness
+// signal and the TTL stays in charge.
+func TestExplicitKeyHasNoLivenessSignal(t *testing.T) {
+	b := testBroker(t, DefaultConfig())
+	t0 := time.Unix(1700000000, 0)
+
+	b.mu.Lock()
+	l := b.grantLocked(command("ci-lane"), t0, 30*time.Second)
+	l.Running, l.LastActive = 0, t0
+	b.mu.Unlock()
+
+	if l.OwnerPID != 0 {
+		t.Errorf("OwnerPID = %d, want 0 for a pid-less key", l.OwnerPID)
+	}
+	b.sweep(t0.Add(10 * time.Second))
+	if b.holderAt() != "ci-lane" {
+		t.Error("pid-less lease was reclaimed before its idle TTL")
+	}
+}
+
+func TestOwnerPIDFromSession(t *testing.T) {
+	cases := map[string]int{
+		"claude-97333":   97333,
+		"bun-49286":      49286,
+		"pid-1":          0, // init is never an agent
+		"ci-lane-3":      3, // digits after the last dash are indistinguishable
+		"ci-lane":        0,
+		"claude":         0,
+		"claude-abc1234": 0,
+	}
+	for session, want := range cases {
+		if got := OwnerPIDFromSession(session); got != want {
+			t.Errorf("OwnerPIDFromSession(%q) = %d, want %d", session, got, want)
+		}
+	}
+}
+
+func TestSharedIdentityWarning(t *testing.T) {
+	if w := sharedIdentityWarning("bun-49286", "process tree"); w == "" {
+		t.Error("a bun-keyed identity should warn about sharing")
+	}
+	if w := sharedIdentityWarning("claude-97333", "process tree"); w != "" {
+		t.Errorf("a claude-keyed identity should not warn, got %q", w)
+	}
+	// An explicit key is deliberate, whatever it is named after.
+	if w := sharedIdentityWarning("node-1", "ADB_HARBOR_SESSION"); w != "" {
+		t.Errorf("explicit key warned: %q", w)
 	}
 }
