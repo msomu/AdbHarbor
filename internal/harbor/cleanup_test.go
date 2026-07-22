@@ -9,13 +9,13 @@ func TestNewPackagesToRemove(t *testing.T) {
 	protected := DefaultConfig().ProtectedPackages
 	baseline := []string{"com.example.existing", "com.android.chrome", "org.other.app"}
 	current := []string{
-		"com.example.existing",     // pre-existing: keep
-		"com.android.chrome",       // pre-existing + protected: keep
-		"com.example.newapp",       // session-installed: remove
-		"com.example.newapp.test",  // session-installed test pkg: remove
-		"com.google.newthing",      // appeared but protected prefix: keep
-		"android.autoinstalled",    // protected prefix "android": keep
-		"org.other.app",            // pre-existing: keep
+		"com.example.existing",    // pre-existing: keep
+		"com.android.chrome",      // pre-existing + protected: keep
+		"com.example.newapp",      // session-installed: remove
+		"com.example.newapp.test", // session-installed test pkg: remove
+		"com.google.newthing",     // appeared but protected prefix: keep
+		"android.autoinstalled",   // protected prefix "android": keep
+		"org.other.app",           // pre-existing: keep
 	}
 	got := newPackagesToRemove(current, baseline, protected)
 	want := []string{"com.example.newapp", "com.example.newapp.test"}

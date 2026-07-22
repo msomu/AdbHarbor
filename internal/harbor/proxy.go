@@ -164,7 +164,7 @@ func (b *Broker) proxyConn(c net.Conn) {
 			return
 		}
 
-		session, procName, observer := b.sessionForConn(c)
+		session, procName, owner, observer := b.sessionForConn(c)
 		if observer {
 			// Passive tools (screen mirrors) stream forever but must not
 			// own the device.
@@ -175,10 +175,11 @@ func (b *Broker) proxyConn(c net.Conn) {
 			return
 		}
 		lease, err := b.AcquireLocalBlocking(AcquireReq{
-			Serial:  serial,
-			Session: session,
-			Holder:  fmt.Sprintf("%s (%s)", session, procName),
-			Command: true,
+			Serial:   serial,
+			Session:  session,
+			Holder:   fmt.Sprintf("%s (%s)", session, procName),
+			OwnerPID: owner,
+			Command:  true,
 		}, b.config().WaitSec, nil)
 		if err != nil {
 			log.Printf("proxy: %s denied %s on %s: %v", session, firstLine(svc), serial, err)
@@ -229,22 +230,22 @@ func (b *Broker) soleOnlineSerial() string {
 	return sole
 }
 
-func (b *Broker) sessionForConn(c net.Conn) (session, procName string, observer bool) {
+func (b *Broker) sessionForConn(c net.Conn) (session, procName string, owner int, observer bool) {
 	remote, ok := c.RemoteAddr().(*net.TCPAddr)
 	local, okLocal := c.LocalAddr().(*net.TCPAddr)
 	if !ok || !okLocal {
-		return "unknown", "unknown", false
+		return "unknown", "unknown", 0, false
 	}
 	pid, name, err := peerPID(local, remote)
 	if err != nil || pid <= 0 {
-		return fmt.Sprintf("port-%d", remote.Port), "unknown", false
+		return fmt.Sprintf("port-%d", remote.Port), "unknown", 0, false
 	}
 	cfg := b.config()
 	if isObserverProc(name, cfg.ObserverProcs) {
-		return name, name, true
+		return name, name, pid, true
 	}
-	session, _, observer = classifyClient(pid, cfg)
-	return session, name, observer
+	session, _, owner, observer = classifyClient(pid, cfg)
+	return session, name, owner, observer
 }
 
 // ---- transport request parsing ----

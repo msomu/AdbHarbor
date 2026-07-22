@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -62,12 +63,17 @@ type Lease struct {
 }
 
 type Waiter struct {
-	ID       string
-	Serial   string
-	Session  string
-	Holder   string
-	Command  bool
-	IdleTTL  time.Duration
+	ID      string
+	Serial  string
+	Session string
+	Holder  string
+	Command bool
+	IdleTTL time.Duration
+	// req is the acquisition this waiter is still trying to make. A lease
+	// granted from the queue is built from it, so an explicit TTL or an
+	// advertised estimate survives having had to wait — losing them here
+	// would silently downgrade exactly the contested case they matter in.
+	req      AcquireReq
 	Enqueued time.Time
 	LastPoll time.Time
 	ch       chan struct{}
@@ -237,7 +243,8 @@ func (b *Broker) handleAcquireAny(w http.ResponseWriter, r *http.Request) {
 	now := time.Now()
 	acq := AcquireReq{
 		Session: req.Session, Holder: req.Holder, PID: req.PID,
-		TTLSec: req.TTLSec, ETASec: req.ETASec, ETANote: req.ETANote,
+		OwnerPID: req.OwnerPID,
+		TTLSec:   req.TTLSec, ETASec: req.ETASec, ETANote: req.ETANote,
 		Explicit: true,
 	}
 	idle := time.Duration(b.config().IdleTTLSec) * time.Second
@@ -245,13 +252,24 @@ func (b *Broker) handleAcquireAny(w http.ResponseWriter, r *http.Request) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	// Sticky: a session that already holds a device keeps getting it.
-	for _, l := range b.leases {
+	// Sticky: a session that already holds a device keeps getting it. Scan in
+	// serial order so a session holding two devices gets the same answer
+	// every time rather than whichever map iteration surfaced first.
+	sticky := make([]string, 0, len(b.leases))
+	for serial, l := range b.leases {
 		if l.Session == req.Session {
+			sticky = append(sticky, serial)
+		}
+	}
+	sort.Strings(sticky)
+	for _, serial := range sticky {
+		l := b.leases[serial]
+		{
 			l.LastActive, l.LastBeat, l.Claimed = now, now, true
 			l.Explicit = true
 			l.ExpiresAt = now.Add(b.explicitTTL(acq))
 			applyETA(l, req.ETASec, req.ETANote, now)
+			b.saveStateLocked()
 			writeJSON(w, AcquireAnyResp{Granted: true, Serial: l.Serial, LeaseID: l.ID})
 			return
 		}
@@ -294,7 +312,7 @@ func (b *Broker) acquireLocked(req AcquireReq, now time.Time, idle time.Duration
 	if b.cleaning[req.Serial] {
 		wt := &Waiter{
 			ID: b.newID("w"), Serial: req.Serial, Session: req.Session,
-			Holder: req.Holder, Command: req.Command, IdleTTL: idle,
+			Holder: req.Holder, Command: req.Command, IdleTTL: idle, req: req,
 			Enqueued: now, LastPoll: now, ch: make(chan struct{}),
 		}
 		b.queues[req.Serial] = append(b.queues[req.Serial], wt)
@@ -314,7 +332,11 @@ func (b *Broker) acquireLocked(req AcquireReq, now time.Time, idle time.Duration
 			l.Explicit = true
 			l.ExpiresAt = now.Add(b.explicitTTL(req))
 		}
-		applyETA(l, req.ETASec, req.ETANote, now)
+		if applyETA(l, req.ETASec, req.ETANote, now) {
+			// Renewals are otherwise in-memory only; an estimate that did not
+			// reach state.json would come back stale after a hard restart.
+			b.saveStateLocked()
+		}
 		return l, nil
 	}
 	if l == nil {
@@ -322,7 +344,7 @@ func (b *Broker) acquireLocked(req AcquireReq, now time.Time, idle time.Duration
 	}
 	wt := &Waiter{
 		ID: b.newID("w"), Serial: req.Serial, Session: req.Session,
-		Holder: req.Holder, Command: req.Command, IdleTTL: idle,
+		Holder: req.Holder, Command: req.Command, IdleTTL: idle, req: req,
 		Enqueued: now, LastPoll: now, ch: make(chan struct{}),
 	}
 	b.queues[req.Serial] = append(b.queues[req.Serial], wt)
@@ -451,7 +473,7 @@ func (b *Broker) explicitTTL(req AcquireReq) time.Duration {
 func (b *Broker) grantLocked(req AcquireReq, now time.Time, idle time.Duration) *Lease {
 	l := &Lease{
 		ID: b.newID("lease"), Serial: req.Serial, Session: req.Session,
-		Holder: req.Holder, PID: req.PID, OwnerPID: OwnerPIDFromSession(req.Session),
+		Holder: req.Holder, PID: req.PID, OwnerPID: req.OwnerPID,
 		AcquiredAt: now, LastActive: now, LastBeat: now,
 		IdleTTL: idle, Explicit: req.Explicit, Claimed: true,
 	}
@@ -609,7 +631,7 @@ func (b *Broker) handleETA(w http.ResponseWriter, r *http.Request) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	var target *Lease
+	var mine []*Lease
 	for _, l := range b.leases {
 		if l.Session != req.Session {
 			continue
@@ -617,13 +639,26 @@ func (b *Broker) handleETA(w http.ResponseWriter, r *http.Request) {
 		if req.Serial != "" && l.Serial != req.Serial {
 			continue
 		}
-		target = l
-		break
+		mine = append(mine, l)
 	}
-	if target == nil {
+	if len(mine) == 0 {
 		writeJSON(w, ETAResp{Message: "you hold no lease to set an estimate on"})
 		return
 	}
+	if len(mine) > 1 {
+		// Map iteration order is randomized, so picking one here would
+		// attach the estimate to a different device run to run and leave the
+		// agents queued on the other seeing nothing.
+		serials := make([]string, 0, len(mine))
+		for _, l := range mine {
+			serials = append(serials, l.Serial)
+		}
+		sort.Strings(serials)
+		writeJSON(w, ETAResp{Message: fmt.Sprintf(
+			"you hold %s — name one with -s SERIAL", strings.Join(serials, " and "))})
+		return
+	}
+	target := mine[0]
 	if req.Clear {
 		target.ETA, target.ETANote = time.Time{}, ""
 	} else {
@@ -707,14 +742,17 @@ func leaseInfo(l *Lease) LeaseInfo {
 
 // applyETA sets the advertised finish time, ignoring a zero duration so a
 // command that says nothing about timing leaves an existing estimate alone.
-func applyETA(l *Lease, etaSec int, note string, now time.Time) {
+func applyETA(l *Lease, etaSec int, note string, now time.Time) bool {
 	if etaSec <= 0 {
-		return
+		return false
 	}
 	l.ETA = now.Add(time.Duration(etaSec) * time.Second)
 	if note != "" {
+		// A refreshed time with no new reason keeps the old reason: an
+		// estimate is more useful with a stale note than with none.
 		l.ETANote = note
 	}
+	return true
 }
 
 func (b *Broker) leaseByIDLocked(id string) *Lease {
@@ -766,12 +804,18 @@ func (b *Broker) grantNextLocked(serial string, now time.Time) {
 	if idle <= 0 {
 		idle = time.Duration(b.config().IdleTTLSec) * time.Second
 	}
+	req := head.req
+	req.Serial, req.Session, req.Holder = serial, head.Session, head.Holder
 	l := &Lease{
 		ID: b.newID("lease"), Serial: serial, Session: head.Session,
-		Holder: head.Holder, OwnerPID: OwnerPIDFromSession(head.Session),
+		Holder: head.Holder, PID: req.PID, OwnerPID: req.OwnerPID,
 		AcquiredAt: now, LastActive: now, LastBeat: now,
-		IdleTTL: idle,
+		IdleTTL: idle, Explicit: req.Explicit,
 	}
+	if req.Explicit {
+		l.ExpiresAt = now.Add(b.explicitTTL(req))
+	}
+	applyETA(l, req.ETASec, req.ETANote, now)
 	if head.Command {
 		l.Running = 1
 	}

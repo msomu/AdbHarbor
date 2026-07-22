@@ -129,8 +129,11 @@ func CmdETA(args []string) error {
 		if err != nil {
 			return fmt.Errorf("bad duration %q: %w", durArg, err)
 		}
-		if d <= 0 {
-			return errors.New("estimate must be positive; use --clear to withdraw one")
+		if d < time.Second {
+			// Estimates are carried in whole seconds; anything shorter would
+			// truncate to zero, which the broker reads as "said nothing" and
+			// would leave a previous estimate silently in force.
+			return errors.New("estimate must be at least 1s; use --clear to withdraw one")
 		}
 		req.ETASec = int(d.Seconds())
 	}
@@ -281,7 +284,7 @@ func CmdAcquire(args []string) error {
 	usb := fs.Bool("usb", false, "with --any: only USB devices")
 	emulator := fs.Bool("emulator", false, "with --any: only emulators")
 	ttl := fs.Duration("ttl", 0, "how long to hold the lease (default from config)")
-	eta := fs.Duration("eta", 0, "how long you expect to need it — advisory, shown to waiters")
+	eta := fs.Duration("eta", 0, "how long you expect to need it — advisory, shown to waiters (min 1s)")
 	note := fs.String("note", "", "what you are doing, shown to whoever is waiting")
 	sessionFlag := fs.String("session", "", "session key (default: auto-detected)")
 	if err := fs.Parse(args); err != nil {
@@ -293,19 +296,23 @@ func CmdAcquire(args []string) error {
 	if *serial == "" {
 		return fmt.Errorf("acquire: -s SERIAL or --any is required")
 	}
+	if *eta != 0 && *eta < time.Second {
+		return errors.New("acquire: --eta must be at least 1s")
+	}
 	if err := EnsureDaemon(); err != nil {
 		return err
 	}
 	cfg := LoadConfig()
-	session := *sessionFlag
+	session, owner := *sessionFlag, 0
 	if session == "" {
-		session = DetectSession(cfg)
+		session, owner, _ = DetectSessionOwner(cfg)
 	}
 	req := AcquireReq{
 		Serial:   *serial,
 		Session:  session,
 		Holder:   HolderDesc(session),
 		PID:      os.Getpid(),
+		OwnerPID: owner,
 		TTLSec:   int(ttl.Seconds()),
 		ETASec:   int(eta.Seconds()),
 		ETANote:  *note,
@@ -336,14 +343,15 @@ func cmdAcquireAny(usb, emulator bool, ttl, eta time.Duration, note, sessionFlag
 		return err
 	}
 	cfg := LoadConfig()
-	session := sessionFlag
+	session, owner := sessionFlag, 0
 	if session == "" {
-		session = DetectSession(cfg)
+		session, owner, _ = DetectSessionOwner(cfg)
 	}
 	resp, err := AcquireAny(AcquireAnyReq{
 		Session:  session,
 		Holder:   HolderDesc(session),
 		PID:      os.Getpid(),
+		OwnerPID: owner,
 		TTLSec:   int(ttl.Seconds()),
 		ETASec:   int(eta.Seconds()),
 		ETANote:  note,

@@ -3,13 +3,17 @@ package harbor
 import "time"
 
 type AcquireReq struct {
-	Serial     string `json:"serial"`
-	Session    string `json:"session"`
-	Holder     string `json:"holder"`
-	PID        int    `json:"pid"`
-	IdleTTLSec int    `json:"idle_ttl_sec,omitempty"`
-	TTLSec     int    `json:"ttl_sec,omitempty"`
-	Explicit   bool   `json:"explicit,omitempty"`
+	Serial  string `json:"serial"`
+	Session string `json:"session"`
+	Holder  string `json:"holder"`
+	PID     int    `json:"pid"`
+	// OwnerPID is the process whose lifetime this session tracks, as
+	// resolved by the caller. Zero means the caller has no such process to
+	// offer and the lease must not be judged on liveness.
+	OwnerPID   int  `json:"owner_pid,omitempty"`
+	IdleTTLSec int  `json:"idle_ttl_sec,omitempty"`
+	TTLSec     int  `json:"ttl_sec,omitempty"`
+	Explicit   bool `json:"explicit,omitempty"`
 	// Command marks the acquisition as a running shim command: the lease's
 	// running counter is incremented and must be balanced by /v1/end.
 	Command bool `json:"command,omitempty"`
@@ -67,6 +71,7 @@ type AcquireAnyReq struct {
 	Session  string `json:"session"`
 	Holder   string `json:"holder"`
 	PID      int    `json:"pid"`
+	OwnerPID int    `json:"owner_pid,omitempty"`
 	TTLSec   int    `json:"ttl_sec,omitempty"`
 	ETASec   int    `json:"eta_sec,omitempty"`
 	ETANote  string `json:"eta_note,omitempty"`

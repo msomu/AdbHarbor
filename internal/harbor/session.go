@@ -21,7 +21,7 @@ import (
 // every command that agent runs and differs between two agents even of the
 // same kind. Fallback: the immediate parent shell.
 func DetectSession(cfg *Config) string {
-	s, _ := DetectSessionObserver(cfg)
+	s, _, _ := DetectSessionOwner(cfg)
 	return s
 }
 
@@ -29,15 +29,19 @@ func DetectSession(cfg *Config) string {
 // for a known agent process; used both by the shim (from its parent) and by
 // the ADB server proxy (from the connecting client's pid).
 func DetectSessionForPID(pid int, cfg *Config) string {
-	s, _ := classifyPID(pid, cfg)
+	s, _, _ := classifyPID(pid, cfg)
 	return s
 }
 
-// classifyPID resolves the session key for a process and whether it belongs
-// to an observer tool (scrcpy and friends). The walk checks each ancestor
-// against both lists; the NEAREST match wins, so scrcpy spawned by an agent
-// is still an observer.
-func classifyPID(pid int, cfg *Config) (session string, observer bool) {
+// classifyPID resolves the session key for a process, the process that key
+// belongs to, and whether it is an observer tool (scrcpy and friends). The
+// walk checks each ancestor against both lists; the NEAREST match wins, so
+// scrcpy spawned by an agent is still an observer.
+//
+// owner is returned separately rather than being read back out of the key
+// later: a key is a display string, and a string that merely looks like it
+// ends in a pid is not evidence that it does.
+func classifyPID(pid int, cfg *Config) (session string, owner int, observer bool) {
 	cur := pid
 	for depth := 0; depth < 25 && cur > 1; depth++ {
 		name, ppid, ok := psInfo(cur)
@@ -45,26 +49,37 @@ func classifyPID(pid int, cfg *Config) (session string, observer bool) {
 			break
 		}
 		if isObserverProc(name, cfg.ObserverProcs) {
-			return fmt.Sprintf("%s-%d", name, cur), true
+			return fmt.Sprintf("%s-%d", name, cur), cur, true
 		}
 		if matchesAgent(name, cfg.AgentProcs) {
-			return fmt.Sprintf("%s-%d", name, cur), false
+			return fmt.Sprintf("%s-%d", name, cur), cur, false
 		}
 		cur = ppid
 	}
 	// No agent ancestor: key on the starting process itself, which is
 	// stable for its lifetime (a shell, a gradle daemon, ...).
 	if name, _, ok := psInfo(pid); ok {
-		return fmt.Sprintf("%s-%d", name, pid), false
+		return fmt.Sprintf("%s-%d", name, pid), pid, false
 	}
-	return fmt.Sprintf("pid-%d", pid), false
+	return fmt.Sprintf("pid-%d", pid), pid, false
 }
 
 // DetectSessionObserver is DetectSession plus the observer flag for the
 // calling context (shim): observer commands must not take leases.
 func DetectSessionObserver(cfg *Config) (string, bool) {
+	s, _, obs := DetectSessionOwner(cfg)
+	return s, obs
+}
+
+// DetectSessionOwner also reports the process whose lifetime the session
+// tracks, which the broker uses to reclaim a device from an agent that died.
+// An explicitly-set key names no process, so it reports 0 — meaning "no
+// liveness signal, leave this lease to its TTL". Inferring a pid from such a
+// key would let a session named `ci-run-8123` be judged dead because pid 8123
+// does not exist.
+func DetectSessionOwner(cfg *Config) (session string, owner int, observer bool) {
 	if key, _ := envSessionKey(os.Getenv); key != "" {
-		return key, false
+		return key, 0, false
 	}
 	return classifyPID(os.Getppid(), cfg)
 }
@@ -75,7 +90,7 @@ func DetectSessionSource(cfg *Config) (key, source string) {
 	if key, src := envSessionKey(os.Getenv); key != "" {
 		return key, src
 	}
-	key, _ = classifyPID(os.Getppid(), cfg)
+	key, _, _ = classifyPID(os.Getppid(), cfg)
 	return key, "process tree"
 }
 
@@ -105,15 +120,16 @@ func envSessionKey(lookup func(string) string) (key, source string) {
 // inherited and survives the spawning shell exiting — which is exactly when
 // the tree walk degrades to a per-command key and an agent starts queueing
 // behind its own lingering lease.
-func classifyClient(pid int, cfg *Config) (session, source string, observer bool) {
-	tree, observer := classifyPID(pid, cfg)
+func classifyClient(pid int, cfg *Config) (session, source string, owner int, observer bool) {
+	tree, treeOwner, observer := classifyPID(pid, cfg)
 	if observer {
-		return tree, "observer", true
+		return tree, "observer", treeOwner, true
 	}
 	if key, src := sessionFromProcEnv(pid); key != "" {
-		return key, src, false
+		// An explicit key names no process: see DetectSessionOwner.
+		return key, src, 0, false
 	}
-	return tree, "process tree", false
+	return tree, "process tree", treeOwner, false
 }
 
 // sessionFromProcEnv reads another process's environment. macOS has no
@@ -161,23 +177,6 @@ func isEnvName(s string) bool {
 		}
 	}
 	return true
-}
-
-// OwnerPIDFromSession extracts the process a tree-derived session key is
-// named for ("claude-97333" -> 97333), which is the agent process itself:
-// long-lived, and gone exactly when the agent is. Explicit keys set through
-// ADB_HARBOR_SESSION carry no pid and return 0, meaning "no liveness signal
-// — fall back to the TTL".
-func OwnerPIDFromSession(session string) int {
-	i := strings.LastIndex(session, "-")
-	if i < 0 {
-		return 0
-	}
-	pid, err := strconv.Atoi(session[i+1:])
-	if err != nil || pid <= 1 {
-		return 0
-	}
-	return pid
 }
 
 // processAlive reports whether pid still exists. Signal 0 performs the

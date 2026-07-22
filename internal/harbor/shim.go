@@ -64,7 +64,7 @@ func RunShim(args []string) int {
 		return execReal(real, args, execEnv)
 	}
 
-	session, observer := DetectSessionObserver(cfg)
+	session, owner, observer := DetectSessionOwner(cfg)
 	if observer {
 		// scrcpy-style observer tools stream through adb but must not own
 		// the device.
@@ -80,6 +80,7 @@ func RunShim(args []string) int {
 		Session:    session,
 		Holder:     HolderDesc(session),
 		PID:        os.Getpid(),
+		OwnerPID:   owner,
 		IdleTTLSec: envInt("ADB_HARBOR_IDLE", 0),
 		ETASec:     envSeconds("ADB_HARBOR_ETA"),
 		ETANote:    os.Getenv("ADB_HARBOR_NOTE"),

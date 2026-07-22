@@ -125,12 +125,17 @@ func killHelper(t *testing.T, pid int) {
 
 func TestClassifyClientPrefersEnvOverProcessTree(t *testing.T) {
 	pid := startHelper(t, "ADB_HARBOR_SESSION=agent-6")
-	session, source, observer := classifyClient(pid, DefaultConfig())
+	session, source, owner, observer := classifyClient(pid, DefaultConfig())
 	if observer {
 		t.Fatal("helper classified as an observer")
 	}
 	if session != "agent-6" || source != "ADB_HARBOR_SESSION" {
 		t.Errorf("got (%q, %q), want (agent-6, ADB_HARBOR_SESSION)", session, source)
+	}
+	// An explicit key names no process, so it must offer no liveness signal:
+	// "agent-6" must never be read as pid 6.
+	if owner != 0 {
+		t.Errorf("owner = %d, want 0 for an explicitly-set key", owner)
 	}
 }
 
@@ -144,7 +149,7 @@ func TestClassifyClientObserverBeatsEnv(t *testing.T) {
 	}
 	cfg := DefaultConfig()
 	cfg.ObserverProcs = []string{name}
-	_, _, observer := classifyClient(pid, cfg)
+	_, _, _, observer := classifyClient(pid, cfg)
 	if !observer {
 		t.Errorf("process %q with an observer config was not treated as an observer", name)
 	}
@@ -152,12 +157,17 @@ func TestClassifyClientObserverBeatsEnv(t *testing.T) {
 
 func TestClassifyClientFallsBackToProcessTree(t *testing.T) {
 	pid := startHelper(t)
-	session, source, _ := classifyClient(pid, DefaultConfig())
+	session, source, owner, _ := classifyClient(pid, DefaultConfig())
 	if source != "process tree" {
 		t.Errorf("source = %q, want process tree", source)
 	}
 	if session == "" {
 		t.Error("empty session key")
+	}
+	// A tree-derived key does name a live process, and that is the one case
+	// where a liveness signal is real.
+	if !processAlive(owner) {
+		t.Errorf("owner = %d, want a live process", owner)
 	}
 }
 

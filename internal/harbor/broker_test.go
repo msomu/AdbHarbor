@@ -340,6 +340,7 @@ func TestLeaseReclaimedWhenOwningAgentDies(t *testing.T) {
 	killHelper(t, dead)
 
 	req := command(fmt.Sprintf("claude-%d", dead))
+	req.OwnerPID = dead                   // resolved by the caller, not parsed from the name
 	req.Explicit, req.TTLSec = true, 3600 // a long explicit lease
 	b.mu.Lock()
 	l := b.grantLocked(req, t0, 30*time.Second)
@@ -361,8 +362,10 @@ func TestLeaseSurvivesWhileOwnerIsAlive(t *testing.T) {
 	t0 := time.Unix(1700000000, 0)
 
 	alive := fmt.Sprintf("claude-%d", os.Getpid())
+	req := command(alive)
+	req.OwnerPID = os.Getpid()
 	b.mu.Lock()
-	l := b.grantLocked(command(alive), t0, 30*time.Second)
+	l := b.grantLocked(req, t0, 30*time.Second)
 	l.Running, l.LastActive = 0, t0
 	b.mu.Unlock()
 
@@ -381,8 +384,10 @@ func TestDeadOwnerDoesNotInterruptRunningCommand(t *testing.T) {
 	dead := startHelper(t)
 	killHelper(t, dead)
 
+	req := command(fmt.Sprintf("claude-%d", dead))
+	req.OwnerPID = dead
 	b.mu.Lock()
-	l := b.grantLocked(command(fmt.Sprintf("claude-%d", dead)), t0, 30*time.Second)
+	l := b.grantLocked(req, t0, 30*time.Second)
 	l.Running, l.LastBeat = 1, t0
 	b.mu.Unlock()
 
@@ -392,40 +397,91 @@ func TestDeadOwnerDoesNotInterruptRunningCommand(t *testing.T) {
 	}
 }
 
-// An explicit ADB_HARBOR_SESSION carries no pid, so there is no liveness
-// signal and the TTL stays in charge.
-func TestExplicitKeyHasNoLivenessSignal(t *testing.T) {
-	b := testBroker(t, DefaultConfig())
-	t0 := time.Unix(1700000000, 0)
+// A session key is a display string. Any key can end in digits — including
+// `ci-run-8123`, which is exactly what `adbharbor doctor` tells a user to
+// export — so the owner must be carried as a fact by the caller that knows
+// it, never parsed back out of the name.
+func TestExplicitKeysAreNeverJudgedOnLiveness(t *testing.T) {
+	for _, session := range []string{"ci-run-8123", "claude-40728315", "worker-42", "agent-2", "ci-lane"} {
+		b := testBroker(t, DefaultConfig())
+		t0 := time.Unix(1700000000, 0)
 
-	b.mu.Lock()
-	l := b.grantLocked(command("ci-lane"), t0, 30*time.Second)
-	l.Running, l.LastActive = 0, t0
-	b.mu.Unlock()
+		req := command(session)
+		req.Explicit, req.TTLSec = true, 3600
+		req.OwnerPID = 0 // an explicit key names no process
+		b.mu.Lock()
+		l := b.grantLocked(req, t0, 30*time.Second)
+		l.Running = 0
+		b.mu.Unlock()
 
-	if l.OwnerPID != 0 {
-		t.Errorf("OwnerPID = %d, want 0 for a pid-less key", l.OwnerPID)
-	}
-	b.sweep(t0.Add(10 * time.Second))
-	if b.holderAt() != "ci-lane" {
-		t.Error("pid-less lease was reclaimed before its idle TTL")
+		if l.OwnerPID != 0 {
+			t.Errorf("%s: OwnerPID = %d, want 0", session, l.OwnerPID)
+		}
+		b.sweep(t0.Add(2 * time.Second))
+		if got := b.holderAt(); got != session {
+			t.Errorf("%s: lost the device to the liveness reaper (holder now %q)", session, got)
+		}
 	}
 }
 
-func TestOwnerPIDFromSession(t *testing.T) {
-	cases := map[string]int{
-		"claude-97333":   97333,
-		"bun-49286":      49286,
-		"pid-1":          0, // init is never an agent
-		"ci-lane-3":      3, // digits after the last dash are indistinguishable
-		"ci-lane":        0,
-		"claude":         0,
-		"claude-abc1234": 0,
+// An acquisition that had to queue must arrive intact: the contested case is
+// the one where an explicit TTL and an advertised estimate matter most.
+func TestQueuedAcquireKeepsTTLAndETA(t *testing.T) {
+	b := testBroker(t, DefaultConfig())
+	t0 := time.Unix(1700000000, 0)
+	idle := 30 * time.Second
+
+	leaseA, _ := b.acquireAt(command("agent-a"), t0, idle)
+
+	want := command("agent-b")
+	want.Explicit, want.TTLSec = true, 1800
+	want.ETASec, want.ETANote = 1200, "maestro suite"
+	want.OwnerPID = os.Getpid()
+	_, waitB := b.acquireAt(want, t0.Add(time.Second), idle)
+	if waitB == nil {
+		t.Fatal("agent-b should have queued")
 	}
-	for session, want := range cases {
-		if got := OwnerPIDFromSession(session); got != want {
-			t.Errorf("OwnerPIDFromSession(%q) = %d, want %d", session, got, want)
-		}
+
+	b.EndLeaseCommand(leaseA.ID)
+	b.mu.Lock()
+	b.leases[dev].LastActive = t0.Add(2 * time.Second)
+	b.mu.Unlock()
+	b.poll(waitB, t0.Add(40*time.Second))
+	b.sweep(t0.Add(41 * time.Second))
+
+	b.mu.Lock()
+	l := b.leases[dev]
+	b.mu.Unlock()
+	if l == nil || l.Session != "agent-b" {
+		t.Fatalf("device did not reach agent-b: %+v", l)
+	}
+	if !l.Explicit {
+		t.Error("explicit acquire came back as an ordinary idle lease")
+	}
+	if l.ETA.IsZero() || l.ETANote != "maestro suite" {
+		t.Errorf("estimate lost in the queue: eta=%v note=%q", l.ETA, l.ETANote)
+	}
+	if l.OwnerPID != os.Getpid() {
+		t.Errorf("OwnerPID = %d, want %d", l.OwnerPID, os.Getpid())
+	}
+}
+
+// Refreshing the time without giving a reason keeps the old reason.
+func TestETARefreshKeepsAnExistingNote(t *testing.T) {
+	l := &Lease{}
+	t0 := time.Unix(1700000000, 0)
+	applyETA(l, 300, "installing 300MB apk", t0)
+	if !applyETA(l, 600, "", t0.Add(time.Minute)) {
+		t.Fatal("applyETA reported no change")
+	}
+	if l.ETANote != "installing 300MB apk" {
+		t.Errorf("note = %q, want it preserved when none was given", l.ETANote)
+	}
+	if applyETA(l, 0, "ignored", t0) {
+		t.Error("a zero estimate must report no change")
+	}
+	if l.ETANote != "installing 300MB apk" {
+		t.Error("a zero estimate must not touch the note")
 	}
 }
 
