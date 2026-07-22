@@ -3,6 +3,7 @@ package harbor
 import (
 	"os"
 	"os/exec"
+	"strings"
 	"testing"
 	"time"
 )
@@ -181,5 +182,52 @@ func TestYouSuffix(t *testing.T) {
 	// An unresolved caller key must not claim every row.
 	if got := youSuffix("", ""); got != "" {
 		t.Errorf("empty session got %q, want empty", got)
+	}
+}
+
+// launchd is where every orphaned process ends up, so it must never become
+// an identity: one shared key would put unrelated agents on one lease.
+func TestLaunchdIsNotAnIdentity(t *testing.T) {
+	for _, pid := range []int{0, 1, -1} {
+		session, owner, observer := classifyPID(pid, DefaultConfig())
+		if session != "" || owner != 0 || observer {
+			t.Errorf("classifyPID(%d) = (%q, %d, %v), want empty", pid, session, owner, observer)
+		}
+	}
+}
+
+// Whatever happens above us, we must still come back with a usable key —
+// an empty session would itself be shared by every caller that produced one.
+func TestDetectSessionOwnerAlwaysResolves(t *testing.T) {
+	session, owner, _ := DetectSessionOwner(DefaultConfig())
+	if session == "" {
+		t.Fatal("no session key resolved")
+	}
+	if owner <= 1 {
+		t.Errorf("owner = %d, want a real process", owner)
+	}
+	if !processAlive(owner) {
+		t.Errorf("owner %d is not alive", owner)
+	}
+}
+
+func TestSessionStartPIDSkipsLaunchd(t *testing.T) {
+	got := sessionStartPID()
+	if got <= 1 {
+		t.Fatalf("sessionStartPID() = %d, must never be launchd", got)
+	}
+	if ppid := os.Getppid(); ppid > 1 && got != ppid {
+		t.Errorf("sessionStartPID() = %d, want our live parent %d", got, ppid)
+	}
+}
+
+// An orphaned command is a shared-identity hazard and doctor has to say so.
+func TestLaunchdIdentityWarns(t *testing.T) {
+	w := sharedIdentityWarning("launchd-1", "process tree")
+	if w == "" {
+		t.Fatal("a launchd-keyed identity must warn")
+	}
+	if !strings.Contains(w, "ADB_HARBOR_SESSION") {
+		t.Errorf("warning does not name the remedy: %q", w)
 	}
 }

@@ -42,6 +42,14 @@ func DetectSessionForPID(pid int, cfg *Config) string {
 // later: a key is a display string, and a string that merely looks like it
 // ends in a pid is not evidence that it does.
 func classifyPID(pid int, cfg *Config) (session string, owner int, observer bool) {
+	if pid <= 1 {
+		// launchd is not an identity. Every orphaned process on the machine
+		// is reparented to pid 1, so keying on it would file unrelated
+		// agents' commands under one session — one shared lease, and the
+		// isolation the broker exists to provide silently gone. An empty
+		// key tells the caller to find its own answer.
+		return "", 0, false
+	}
 	cur := pid
 	for depth := 0; depth < 25 && cur > 1; depth++ {
 		name, ppid, ok := psInfo(cur)
@@ -81,7 +89,25 @@ func DetectSessionOwner(cfg *Config) (session string, owner int, observer bool) 
 	if key, _ := envSessionKey(os.Getenv); key != "" {
 		return key, 0, false
 	}
-	return classifyPID(os.Getppid(), cfg)
+	if session, owner, observer = classifyPID(sessionStartPID(), cfg); session != "" {
+		return session, owner, observer
+	}
+	// Nothing above us to key on. Fall back to this process: a per-command
+	// identity makes an agent queue behind its own linger, which is a bad
+	// day — but it is confined to that agent, where sharing an identity
+	// with unrelated agents is a lease they can take from each other.
+	return classifyPID(os.Getpid(), cfg)
+}
+
+// sessionStartPID is where the walk for an identity begins: our parent,
+// which is the agent's shell and outlives any one command. When that parent
+// has already exited we are reparented to launchd, and pid 1 says nothing
+// about who we are — so start from ourselves instead.
+func sessionStartPID() int {
+	if ppid := os.Getppid(); ppid > 1 {
+		return ppid
+	}
+	return os.Getpid()
 }
 
 // DetectSessionSource is DetectSession plus where the key came from, for
@@ -90,7 +116,7 @@ func DetectSessionSource(cfg *Config) (key, source string) {
 	if key, src := envSessionKey(os.Getenv); key != "" {
 		return key, src
 	}
-	key, _, _ = classifyPID(os.Getppid(), cfg)
+	key, _, _ = DetectSessionOwner(cfg)
 	return key, "process tree"
 }
 

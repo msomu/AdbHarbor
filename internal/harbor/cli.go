@@ -59,7 +59,7 @@ func runningSuffix(n int) string {
 // agent. Keying an identity on one of them is the silent failure mode of
 // auto-detection: every agent underneath collapses into a single session, so
 // they share one lease and stop being isolated from each other.
-var sharedRuntimes = []string{"node", "bun", "deno", "java", "gradle", "python", "python3"}
+var sharedRuntimes = []string{"node", "bun", "deno", "java", "gradle", "python", "python3", "launchd"}
 
 // sharedIdentityWarning flags an identity that is probably shared with other
 // agents. It cannot be certain — one bun process may well host exactly one
@@ -74,10 +74,16 @@ func sharedIdentityWarning(session, source string) string {
 		name = session[:i]
 	}
 	for _, r := range sharedRuntimes {
-		if name == r {
-			return fmt.Sprintf("note: keyed on a shared `%s` process — every agent under it\n"+
-				"                shares one lease. Export ADB_HARBOR_SESSION to separate them.", name)
+		if name != r {
+			continue
 		}
+		if name == "launchd" {
+			return "note: keyed on launchd (pid 1) — this command was orphaned before it\n" +
+				"                could be identified, and every orphaned command on the machine\n" +
+				"                would share this lease. Export ADB_HARBOR_SESSION to fix it."
+		}
+		return fmt.Sprintf("note: keyed on a shared `%s` process — every agent under it\n"+
+			"                shares one lease. Export ADB_HARBOR_SESSION to separate them.", name)
 	}
 	return ""
 }

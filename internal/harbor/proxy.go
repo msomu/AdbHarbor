@@ -237,7 +237,10 @@ func (b *Broker) sessionForConn(c net.Conn) (session, procName string, owner int
 		return "unknown", "unknown", 0, false
 	}
 	pid, name, err := peerPID(local, remote)
-	if err != nil || pid <= 0 {
+	if err != nil || pid <= 1 {
+		// pid 1 is launchd, which identifies nobody: fall back to a key
+		// unique to this connection rather than one every unidentified
+		// client would share.
 		return fmt.Sprintf("port-%d", remote.Port), "unknown", 0, false
 	}
 	cfg := b.config()
