@@ -230,19 +230,20 @@ func (b *Broker) soleOnlineSerial() string {
 }
 
 func (b *Broker) sessionForConn(c net.Conn) (session, procName string, observer bool) {
-	addr, ok := c.RemoteAddr().(*net.TCPAddr)
-	if !ok {
+	remote, ok := c.RemoteAddr().(*net.TCPAddr)
+	local, okLocal := c.LocalAddr().(*net.TCPAddr)
+	if !ok || !okLocal {
 		return "unknown", "unknown", false
 	}
-	pid, name, err := peerPID(addr.Port)
+	pid, name, err := peerPID(local, remote)
 	if err != nil || pid <= 0 {
-		return fmt.Sprintf("port-%d", addr.Port), "unknown", false
+		return fmt.Sprintf("port-%d", remote.Port), "unknown", false
 	}
 	cfg := b.config()
 	if isObserverProc(name, cfg.ObserverProcs) {
 		return name, name, true
 	}
-	session, observer = classifyPID(pid, cfg)
+	session, _, observer = classifyClient(pid, cfg)
 	return session, name, observer
 }
 
@@ -388,11 +389,15 @@ func firstLine(s string) string {
 }
 
 func envWithServerPort(env []string, port int) []string {
+	return envWith(env, "ANDROID_ADB_SERVER_PORT", fmt.Sprintf("%d", port))
+}
+
+func envWith(env []string, key, value string) []string {
 	out := env[:0:0]
 	for _, e := range env {
-		if !strings.HasPrefix(e, "ANDROID_ADB_SERVER_PORT=") {
+		if !strings.HasPrefix(e, key+"=") {
 			out = append(out, e)
 		}
 	}
-	return append(out, fmt.Sprintf("ANDROID_ADB_SERVER_PORT=%d", port))
+	return append(out, key+"="+value)
 }
