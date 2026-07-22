@@ -394,7 +394,7 @@ func (b *Broker) dropWaiter(wt *Waiter) {
 		delete(b.queues, wt.Serial)
 	}
 	if wt.lease != nil && b.leases[wt.Serial] == wt.lease {
-		b.expireLocked(wt.lease, "abandoned")
+		b.expireLocked(wt.lease, time.Now(), "abandoned")
 	}
 }
 
@@ -572,7 +572,7 @@ func (b *Broker) handleRelease(w http.ResponseWriter, r *http.Request) {
 	if req.Force && l.Session != req.Session {
 		reason = "force-released"
 	}
-	b.expireLocked(l, reason)
+	b.expireLocked(l, time.Now(), reason)
 	writeJSON(w, ReleaseResp{Released: true})
 }
 
@@ -654,7 +654,7 @@ func (b *Broker) leaseByIDLocked(id string) *Lease {
 
 // expireLocked removes a lease and hands the device to the next session —
 // via a cleanup pass first when enabled and a baseline exists.
-func (b *Broker) expireLocked(l *Lease, reason string) {
+func (b *Broker) expireLocked(l *Lease, now time.Time, reason string) {
 	delete(b.leases, l.Serial)
 	b.hist(reason, l, fmt.Sprintf("held %s", time.Since(l.AcquiredAt).Round(time.Second)))
 	log.Printf("%s %s (was %s)", reason, l.Serial, l.Holder)
@@ -664,16 +664,15 @@ func (b *Broker) expireLocked(l *Lease, reason string) {
 		b.saveStateLocked()
 		return
 	}
-	b.grantNextLocked(l.Serial)
+	b.grantNextLocked(l.Serial, now)
 	b.saveStateLocked()
 }
 
 // grantNextLocked pops the queue head for serial and grants it a lease.
 // Other queued waiters from the same session piggyback on the same lease.
-func (b *Broker) grantNextLocked(serial string) {
+func (b *Broker) grantNextLocked(serial string, now time.Time) {
 	q := b.queues[serial]
 	// Drop waiters whose client stopped polling.
-	now := time.Now()
 	alive := q[:0]
 	for _, wt := range q {
 		if wt.lease == nil && now.Sub(wt.LastPoll) > staleWaiter {
@@ -735,37 +734,43 @@ func (b *Broker) grantNextLocked(serial string) {
 
 func (b *Broker) reaper() {
 	for range time.Tick(reaperInterval) {
-		now := time.Now()
 		b.reloadConfigIfChanged()
-		b.mu.Lock()
-		for _, l := range b.leases {
-			if !l.Claimed && now.Sub(l.AcquiredAt) > unclaimedGrace {
-				b.expireLocked(l, "unclaimed")
-				continue
+		b.sweep(time.Now())
+	}
+}
+
+// sweep is one reaper pass at instant now: expire what is due and hand each
+// freed device to its queue. Taking the instant as an argument keeps the
+// handoff rules testable without sleeping through real TTLs.
+func (b *Broker) sweep(now time.Time) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, l := range b.leases {
+		if !l.Claimed && now.Sub(l.AcquiredAt) > unclaimedGrace {
+			b.expireLocked(l, now, "unclaimed")
+			continue
+		}
+		if l.Running > 0 && now.Sub(l.LastBeat) > orphanBeat {
+			log.Printf("orphaned commands on %s (%s): resetting running count", l.Serial, l.Holder)
+			l.Running = 0
+			l.LastActive = now
+		}
+		switch {
+		case l.Explicit:
+			if l.Running == 0 && now.After(l.ExpiresAt) {
+				b.expireLocked(l, now, "expired")
 			}
-			if l.Running > 0 && now.Sub(l.LastBeat) > orphanBeat {
-				log.Printf("orphaned commands on %s (%s): resetting running count", l.Serial, l.Holder)
-				l.Running = 0
-				l.LastActive = now
-			}
-			switch {
-			case l.Explicit:
-				if l.Running == 0 && now.After(l.ExpiresAt) {
-					b.expireLocked(l, "expired")
-				}
-			default:
-				if l.Running == 0 && now.Sub(l.LastActive) > l.IdleTTL {
-					b.expireLocked(l, "idle-released")
-				}
+		default:
+			if l.Running == 0 && now.Sub(l.LastActive) > l.IdleTTL {
+				b.expireLocked(l, now, "idle-released")
 			}
 		}
-		// GC waiters that were granted but never picked up their lease.
-		for id, wt := range b.waiters {
-			if wt.lease != nil && now.Sub(wt.LastPoll) > staleWaiter {
-				delete(b.waiters, id)
-			}
+	}
+	// GC waiters that were granted but never picked up their lease.
+	for id, wt := range b.waiters {
+		if wt.lease != nil && now.Sub(wt.LastPoll) > staleWaiter {
+			delete(b.waiters, id)
 		}
-		b.mu.Unlock()
 	}
 }
 

@@ -109,7 +109,7 @@ func (b *Broker) runCleanup(l *Lease) {
 	}
 	b.mu.Lock()
 	delete(b.cleaning, l.Serial)
-	b.grantNextLocked(l.Serial)
+	b.grantNextLocked(l.Serial, time.Now())
 	b.saveStateLocked()
 	b.mu.Unlock()
 }
