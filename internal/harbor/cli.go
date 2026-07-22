@@ -24,6 +24,7 @@ func CmdDevices() error {
 	if resp.Error != "" {
 		fmt.Fprintln(os.Stderr, "adbharbor:", resp.Error)
 	}
+	me := DetectSession(LoadConfig())
 	tw := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
 	fmt.Fprintln(tw, "SERIAL\tSTATE\tMODEL\tLEASE\tQUEUE")
 	sort.Slice(resp.Devices, func(i, j int) bool { return resp.Devices[i].Serial < resp.Devices[j].Serial })
@@ -33,8 +34,9 @@ func CmdDevices() error {
 			lease = "session cleanup"
 		}
 		if d.Lease != nil {
-			lease = fmt.Sprintf("%s (%s%s)", d.Lease.Holder,
-				time.Since(d.Lease.AcquiredAt).Round(time.Second), runningSuffix(d.Lease.Running))
+			lease = fmt.Sprintf("%s (%s%s)%s", d.Lease.Holder,
+				time.Since(d.Lease.AcquiredAt).Round(time.Second), runningSuffix(d.Lease.Running),
+				youSuffix(d.Lease.Session, me))
 		}
 		queue := "-"
 		if d.Waiting > 0 {
@@ -52,6 +54,17 @@ func runningSuffix(n int) string {
 	return ""
 }
 
+// youSuffix marks the rows belonging to the caller. Without it a session
+// reading this output cannot tell its own lease from a stranger's, and an
+// agent blocked behind what is actually its own lingering lease has no way
+// to see that.
+func youSuffix(session, me string) string {
+	if me != "" && session == me {
+		return " <- you"
+	}
+	return ""
+}
+
 func CmdStatus() error {
 	if err := EnsureDaemon(); err != nil {
 		return err
@@ -60,6 +73,7 @@ func CmdStatus() error {
 	if err != nil {
 		return err
 	}
+	me := DetectSession(LoadConfig())
 	if len(st.Leases) == 0 {
 		fmt.Println("no active leases")
 	}
@@ -71,12 +85,58 @@ func CmdStatus() error {
 		} else {
 			fmt.Printf("  idle-ttl=%ds", l.IdleTTLSec)
 		}
-		fmt.Println()
+		fmt.Println(youSuffix(l.Session, me))
 		for i, wt := range st.Queues[l.Serial] {
-			fmt.Printf("    queue[%d]: %s (waiting %s)\n", i+1, wt.Holder, time.Since(wt.Enqueued).Round(time.Second))
+			fmt.Printf("    queue[%d]: %s (waiting %s)%s\n", i+1, wt.Holder,
+				time.Since(wt.Enqueued).Round(time.Second), youSuffix(wt.Session, me))
 		}
 	}
 	return nil
+}
+
+// CmdWhoami answers "which of these leases is mine?" — the question every
+// other command left an agent guessing at.
+func CmdWhoami() error {
+	cfg := LoadConfig()
+	session, source := DetectSessionSource(cfg)
+	fmt.Printf("session  %s\n", session)
+	fmt.Printf("source   %s\n", source)
+
+	if err := EnsureDaemon(); err != nil {
+		return err
+	}
+	st, err := FetchState()
+	if err != nil {
+		return err
+	}
+	held := []string{}
+	for _, l := range st.Leases {
+		if l.Session == session {
+			held = append(held, fmt.Sprintf("%s (%s%s)", l.Serial,
+				time.Since(l.AcquiredAt).Round(time.Second), runningSuffix(l.Running)))
+		}
+	}
+	fmt.Printf("holding  %s\n", orDash(strings.Join(held, ", ")))
+
+	waiting := []string{}
+	for serial, q := range st.Queues {
+		for i, wt := range q {
+			if wt.Session == session {
+				waiting = append(waiting, fmt.Sprintf("%s (position %d, %s)",
+					serial, i+1, time.Since(wt.Enqueued).Round(time.Second)))
+			}
+		}
+	}
+	sort.Strings(waiting)
+	fmt.Printf("waiting  %s\n", orDash(strings.Join(waiting, ", ")))
+	return nil
+}
+
+func orDash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
 }
 
 func CmdWho(args []string) error {
@@ -91,12 +151,17 @@ func CmdWho(args []string) error {
 	if err != nil {
 		return err
 	}
+	me := DetectSession(LoadConfig())
 	for _, l := range st.Leases {
 		if l.Serial == serial {
+			holder := l.Holder
+			if l.Session == me {
+				holder = "you, " + holder
+			}
 			fmt.Printf("%s is held by %s (session %s) since %s, %d command(s) running\n",
-				serial, l.Holder, l.Session, l.AcquiredAt.Format(time.Kitchen), l.Running)
+				serial, holder, l.Session, l.AcquiredAt.Format(time.Kitchen), l.Running)
 			for i, wt := range st.Queues[serial] {
-				fmt.Printf("  queue[%d]: %s\n", i+1, wt.Holder)
+				fmt.Printf("  queue[%d]: %s%s\n", i+1, wt.Holder, youSuffix(wt.Session, me))
 			}
 			return nil
 		}

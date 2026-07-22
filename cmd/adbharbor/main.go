@@ -19,6 +19,7 @@ Usage:
   adbharbor devices             List devices with lease/queue state
   adbharbor status              Show all leases and queues
   adbharbor who -s SERIAL       Show who holds a device
+  adbharbor whoami              Show this session's key, leases and queue spots
   adbharbor acquire -s SERIAL [--ttl 15m] [--session NAME]
                                 Hold a device explicitly (until release or TTL)
   adbharbor acquire --any [--usb|--emulator] [--ttl 15m]
@@ -73,6 +74,8 @@ func main() {
 		err = harbor.CmdStatus()
 	case "who":
 		err = harbor.CmdWho(args[1:])
+	case "whoami":
+		err = harbor.CmdWhoami()
 	case "acquire":
 		err = harbor.CmdAcquire(args[1:])
 	case "release":

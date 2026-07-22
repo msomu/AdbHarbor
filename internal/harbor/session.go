@@ -60,16 +60,104 @@ func classifyPID(pid int, cfg *Config) (session string, observer bool) {
 // DetectSessionObserver is DetectSession plus the observer flag for the
 // calling context (shim): observer commands must not take leases.
 func DetectSessionObserver(cfg *Config) (string, bool) {
-	if v := os.Getenv("ADB_HARBOR_SESSION"); v != "" {
-		return sanitizeKey(v), false
+	if key, _ := envSessionKey(os.Getenv); key != "" {
+		return key, false
 	}
-	if v := os.Getenv("CLAUDE_SESSION_ID"); v != "" {
+	return classifyPID(os.Getppid(), cfg)
+}
+
+// DetectSessionSource is DetectSession plus where the key came from, for
+// `adbharbor whoami`.
+func DetectSessionSource(cfg *Config) (key, source string) {
+	if key, src := envSessionKey(os.Getenv); key != "" {
+		return key, src
+	}
+	key, _ = classifyPID(os.Getppid(), cfg)
+	return key, "process tree"
+}
+
+// envSessionKey derives a session key from an explicit environment
+// override. Every entry point goes through it — the shim reading its own
+// environment, the proxy reading a client's, the CLI reporting identity —
+// so one agent resolves to one key whichever path its commands take. Two
+// spellings of the same key would silently split an agent in two: its
+// second command would queue behind its own first one.
+func envSessionKey(lookup func(string) string) (key, source string) {
+	if v := lookup("ADB_HARBOR_SESSION"); v != "" {
+		return sanitizeKey(v), "ADB_HARBOR_SESSION"
+	}
+	if v := lookup("CLAUDE_SESSION_ID"); v != "" {
 		if len(v) > 8 {
 			v = v[:8]
 		}
-		return "claude-" + sanitizeKey(v), false
+		return "claude-" + sanitizeKey(v), "CLAUDE_SESSION_ID"
 	}
-	return classifyPID(os.Getppid(), cfg)
+	return "", ""
+}
+
+// classifyClient resolves the session for a process connecting to the
+// proxy. Observer status is settled first: a screen mirror must never take
+// a lease, whatever its environment says. An explicit key in the client's
+// environment then wins over the process tree, because the environment is
+// inherited and survives the spawning shell exiting — which is exactly when
+// the tree walk degrades to a per-command key and an agent starts queueing
+// behind its own lingering lease.
+func classifyClient(pid int, cfg *Config) (session, source string, observer bool) {
+	tree, observer := classifyPID(pid, cfg)
+	if observer {
+		return tree, "observer", true
+	}
+	if key, src := sessionFromProcEnv(pid); key != "" {
+		return key, src, false
+	}
+	return tree, "process tree", false
+}
+
+// sessionFromProcEnv reads another process's environment. macOS has no
+// /proc; `ps -E` exposes the environment of same-user processes (platform
+// binaries are redacted under SIP, but adb and the tools that embed it are
+// not). Empty means "nothing explicit set" — never an error worth failing
+// a command over.
+func sessionFromProcEnv(pid int) (key, source string) {
+	out, err := exec.Command("ps", "-Eww", "-p", strconv.Itoa(pid), "-o", "command=").Output()
+	if err != nil {
+		return "", ""
+	}
+	env := parseProcEnv(string(out))
+	return envSessionKey(func(k string) string { return env[k] })
+}
+
+// parseProcEnv pulls KEY=VALUE tokens out of `ps -E` output, where the
+// environment trails the command line. A value containing a space is
+// truncated at the space and an argument shaped like an assignment is taken
+// as env; neither matters for session keys, which are single tokens.
+func parseProcEnv(s string) map[string]string {
+	env := map[string]string{}
+	for _, tok := range strings.Fields(s) {
+		k, v, ok := strings.Cut(tok, "=")
+		if !ok || v == "" || !isEnvName(k) {
+			continue
+		}
+		if _, dup := env[k]; !dup {
+			env[k] = v
+		}
+	}
+	return env
+}
+
+func isEnvName(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r == '_':
+		case i > 0 && r >= '0' && r <= '9':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // HolderDesc is the human-readable owner label shown to other sessions.

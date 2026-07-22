@@ -70,6 +70,11 @@ func RunShim(args []string) int {
 		// the device.
 		return execReal(real, args, execEnv)
 	}
+	// Hand the resolved identity down: the environment is inherited, so
+	// anything the real adb spawns — and anything still running after this
+	// shim exits — keeps reporting the same session to the broker instead
+	// of being classified afresh from a process tree we may no longer be in.
+	execEnv = envWith(execEnv, "ADB_HARBOR_SESSION", session)
 	req := AcquireReq{
 		Serial:     serial,
 		Session:    session,
