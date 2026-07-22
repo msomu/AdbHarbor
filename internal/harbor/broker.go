@@ -29,18 +29,18 @@ const (
 )
 
 type Lease struct {
-	ID         string    `json:"id"`
-	Serial     string    `json:"serial"`
-	Session    string    `json:"session"`
-	Holder     string    `json:"holder"`
-	PID        int       `json:"pid"`
-	AcquiredAt time.Time `json:"acquired_at"`
-	LastActive time.Time `json:"last_active"`
-	LastBeat   time.Time `json:"last_beat"`
-	Running    int       `json:"running"`
+	ID         string        `json:"id"`
+	Serial     string        `json:"serial"`
+	Session    string        `json:"session"`
+	Holder     string        `json:"holder"`
+	PID        int           `json:"pid"`
+	AcquiredAt time.Time     `json:"acquired_at"`
+	LastActive time.Time     `json:"last_active"`
+	LastBeat   time.Time     `json:"last_beat"`
+	Running    int           `json:"running"`
 	IdleTTL    time.Duration `json:"idle_ttl"`
-	Explicit   bool      `json:"explicit"`
-	ExpiresAt  time.Time `json:"expires_at"`
+	Explicit   bool          `json:"explicit"`
+	ExpiresAt  time.Time     `json:"expires_at"`
 	// Claimed is false for a lease granted from the queue until its owner
 	// shows a sign of life (wait pickup, heartbeat, or command end).
 	Claimed bool `json:"claimed"`
@@ -49,6 +49,13 @@ type Lease struct {
 	// command that took it, so this is the only handle on whether the agent
 	// that owns it still exists.
 	OwnerPID int `json:"owner_pid,omitempty"`
+	// ETA is when the holder expects to be finished, and ETANote is what it
+	// is doing. Purely advisory: nothing expires because of it, and passing
+	// it costs the holder nothing but an "overdue" label. It exists so a
+	// queued agent can decide between waiting, taking another device, and
+	// doing something else — a decision it otherwise makes blind.
+	ETA     time.Time `json:"eta,omitempty"`
+	ETANote string    `json:"eta_note,omitempty"`
 	// Baseline is the device's package list at grant time, used by session
 	// cleanup to uninstall only what this session installed.
 	Baseline []string `json:"pkg_baseline,omitempty"`
@@ -70,7 +77,7 @@ type Waiter struct {
 type Broker struct {
 	mu       sync.Mutex
 	cfg      atomic.Pointer[Config] // hot-reloaded; read via b.config()
-	leases   map[string]*Lease  // by serial
+	leases   map[string]*Lease      // by serial
 	queues   map[string][]*Waiter
 	waiters  map[string]*Waiter // by waiter ID
 	cleaning map[string]bool    // serials in post-session cleanup
@@ -131,6 +138,7 @@ func RunDaemon() error {
 	mux.HandleFunc("/v1/heartbeat", b.handleHeartbeat)
 	mux.HandleFunc("/v1/end", b.handleEnd)
 	mux.HandleFunc("/v1/release", b.handleRelease)
+	mux.HandleFunc("/v1/eta", b.handleETA)
 	mux.HandleFunc("/v1/state", b.handleState)
 	mux.HandleFunc("/v1/devices", b.handleDevices)
 
@@ -159,7 +167,11 @@ func leaseDesc(l *Lease) string {
 	if l == nil {
 		return "free"
 	}
-	return fmt.Sprintf("%s for %s", l.Holder, time.Since(l.AcquiredAt).Round(time.Second))
+	desc := fmt.Sprintf("%s for %s", l.Holder, time.Since(l.AcquiredAt).Round(time.Second))
+	if eta := ETADesc(l.ETA, l.ETANote, time.Now()); eta != "" {
+		desc += ", " + eta
+	}
+	return desc
 }
 
 func (b *Broker) serialDescLocked(serial string) string {
@@ -225,7 +237,8 @@ func (b *Broker) handleAcquireAny(w http.ResponseWriter, r *http.Request) {
 	now := time.Now()
 	acq := AcquireReq{
 		Session: req.Session, Holder: req.Holder, PID: req.PID,
-		TTLSec: req.TTLSec, Explicit: true,
+		TTLSec: req.TTLSec, ETASec: req.ETASec, ETANote: req.ETANote,
+		Explicit: true,
 	}
 	idle := time.Duration(b.config().IdleTTLSec) * time.Second
 
@@ -238,6 +251,7 @@ func (b *Broker) handleAcquireAny(w http.ResponseWriter, r *http.Request) {
 			l.LastActive, l.LastBeat, l.Claimed = now, now, true
 			l.Explicit = true
 			l.ExpiresAt = now.Add(b.explicitTTL(acq))
+			applyETA(l, req.ETASec, req.ETANote, now)
 			writeJSON(w, AcquireAnyResp{Granted: true, Serial: l.Serial, LeaseID: l.ID})
 			return
 		}
@@ -300,6 +314,7 @@ func (b *Broker) acquireLocked(req AcquireReq, now time.Time, idle time.Duration
 			l.Explicit = true
 			l.ExpiresAt = now.Add(b.explicitTTL(req))
 		}
+		applyETA(l, req.ETASec, req.ETANote, now)
 		return l, nil
 	}
 	if l == nil {
@@ -440,6 +455,7 @@ func (b *Broker) grantLocked(req AcquireReq, now time.Time, idle time.Duration) 
 		AcquiredAt: now, LastActive: now, LastBeat: now,
 		IdleTTL: idle, Explicit: req.Explicit, Claimed: true,
 	}
+	applyETA(l, req.ETASec, req.ETANote, now)
 	if req.Command {
 		l.Running = 1
 	}
@@ -581,6 +597,42 @@ func (b *Broker) handleRelease(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, ReleaseResp{Released: true})
 }
 
+// handleETA updates the advertised finish time of the caller's own lease.
+// A session may only speak for itself: an estimate is a claim about what
+// its owner is doing, and one agent cannot make that claim for another.
+func (b *Broker) handleETA(w http.ResponseWriter, r *http.Request) {
+	var req ETAReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Session == "" {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	var target *Lease
+	for _, l := range b.leases {
+		if l.Session != req.Session {
+			continue
+		}
+		if req.Serial != "" && l.Serial != req.Serial {
+			continue
+		}
+		target = l
+		break
+	}
+	if target == nil {
+		writeJSON(w, ETAResp{Message: "you hold no lease to set an estimate on"})
+		return
+	}
+	if req.Clear {
+		target.ETA, target.ETANote = time.Time{}, ""
+	} else {
+		applyETA(target, req.ETASec, req.Note, time.Now())
+	}
+	b.saveStateLocked()
+	writeJSON(w, ETAResp{OK: true, Serial: target.Serial})
+}
+
 func (b *Broker) handleState(w http.ResponseWriter, _ *http.Request) {
 	b.mu.Lock()
 	resp := StateResp{Queues: map[string][]WaiterInfo{}}
@@ -645,7 +697,24 @@ func leaseInfo(l *Lease) LeaseInfo {
 		t := l.ExpiresAt
 		info.ExpiresAt = &t
 	}
+	if !l.ETA.IsZero() {
+		t := l.ETA
+		info.ETA = &t
+		info.ETANote = l.ETANote
+	}
 	return info
+}
+
+// applyETA sets the advertised finish time, ignoring a zero duration so a
+// command that says nothing about timing leaves an existing estimate alone.
+func applyETA(l *Lease, etaSec int, note string, now time.Time) {
+	if etaSec <= 0 {
+		return
+	}
+	l.ETA = now.Add(time.Duration(etaSec) * time.Second)
+	if note != "" {
+		l.ETANote = note
+	}
 }
 
 func (b *Broker) leaseByIDLocked(id string) *Lease {

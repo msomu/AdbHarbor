@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 )
 
 // DetectSession derives a stable session key for the calling agent.
@@ -203,6 +204,35 @@ func processIsZombie(pid int) bool {
 		return false
 	}
 	return strings.HasPrefix(strings.TrimSpace(string(out)), "Z")
+}
+
+// ETADesc renders an advertised finish time for whoever is waiting on it.
+// An estimate that has passed is reported as overdue rather than as a
+// negative countdown: a waiter needs to know the number is stale, because a
+// stale estimate and a fresh one imply very different decisions.
+func ETADesc(eta time.Time, note string, now time.Time) string {
+	if eta.IsZero() {
+		return ""
+	}
+	var s string
+	if d := eta.Sub(now); d >= 0 {
+		s = "free in ~" + roundedDur(d)
+	} else {
+		s = "OVERDUE by " + roundedDur(-d)
+	}
+	if note != "" {
+		s += " (" + note + ")"
+	}
+	return s
+}
+
+// roundedDur keeps estimates honest about their precision: seconds below a
+// minute, whole minutes above.
+func roundedDur(d time.Duration) string {
+	if d < time.Minute {
+		return d.Round(time.Second).String()
+	}
+	return d.Round(time.Minute).String()
 }
 
 // HolderDesc is the human-readable owner label shown to other sessions.

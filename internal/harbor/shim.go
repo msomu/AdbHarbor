@@ -81,6 +81,8 @@ func RunShim(args []string) int {
 		Holder:     HolderDesc(session),
 		PID:        os.Getpid(),
 		IdleTTLSec: envInt("ADB_HARBOR_IDLE", 0),
+		ETASec:     envSeconds("ADB_HARBOR_ETA"),
+		ETANote:    os.Getenv("ADB_HARBOR_NOTE"),
 		Command:    true,
 	}
 	waitSec := envInt("ADB_HARBOR_WAIT", cfg.WaitSec)
@@ -99,9 +101,32 @@ func RunShim(args []string) int {
 		return execReal(real, args, execEnv)
 	}
 
+	nudgeIfOverdue(session, serial)
 	code := runLeasedCommand(real, args, leaseID, execEnv)
 	EndCommand(leaseID)
 	return code
+}
+
+// nudgeIfOverdue tells a holder that the estimate it published has passed.
+// An estimate nobody refreshes is worse than none — a waiter reading it
+// makes decisions on a number that stopped being true — and the holder's
+// next command is the one moment it is certain to be listening.
+func nudgeIfOverdue(session, serial string) {
+	st, err := FetchState()
+	if err != nil {
+		return
+	}
+	for _, l := range st.Leases {
+		if l.Session != session || l.Serial != serial || l.ETA == nil {
+			continue
+		}
+		if over := time.Since(*l.ETA); over > 0 {
+			fmt.Fprintf(os.Stderr,
+				"adbharbor: you told waiters %s would be free %s ago; update with `adbharbor eta 5m`\n",
+				serial, over.Round(time.Second))
+		}
+		return
+	}
 }
 
 // runLeasedCommand runs the real adb as a child (so we can report command
@@ -273,6 +298,19 @@ func isSelf(path string) bool {
 
 func hasDotDotPrefix(rel string) bool {
 	return rel == ".." || len(rel) >= 3 && rel[:3] == ".."+string(filepath.Separator)
+}
+
+// envSeconds reads a duration like "8m" from the environment, in seconds.
+func envSeconds(name string) int {
+	v := os.Getenv(name)
+	if v == "" {
+		return 0
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		return 0
+	}
+	return int(d.Seconds())
 }
 
 func envInt(name string, def int) int {

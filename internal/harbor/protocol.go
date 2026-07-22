@@ -13,6 +13,26 @@ type AcquireReq struct {
 	// Command marks the acquisition as a running shim command: the lease's
 	// running counter is incremented and must be balanced by /v1/end.
 	Command bool `json:"command,omitempty"`
+	// ETASec is how long the caller expects to need the device, and ETANote
+	// what for. Advisory: shown to whoever queues behind this lease.
+	ETASec  int    `json:"eta_sec,omitempty"`
+	ETANote string `json:"eta_note,omitempty"`
+}
+
+// ETAReq updates the advertised finish time of the caller's own lease.
+// Serial empty means "whichever device my session holds".
+type ETAReq struct {
+	Session string `json:"session"`
+	Serial  string `json:"serial,omitempty"`
+	ETASec  int    `json:"eta_sec"`
+	Note    string `json:"note,omitempty"`
+	Clear   bool   `json:"clear,omitempty"`
+}
+
+type ETAResp struct {
+	OK      bool   `json:"ok"`
+	Serial  string `json:"serial,omitempty"`
+	Message string `json:"message,omitempty"`
 }
 
 type AcquireResp struct {
@@ -48,6 +68,8 @@ type AcquireAnyReq struct {
 	Holder   string `json:"holder"`
 	PID      int    `json:"pid"`
 	TTLSec   int    `json:"ttl_sec,omitempty"`
+	ETASec   int    `json:"eta_sec,omitempty"`
+	ETANote  string `json:"eta_note,omitempty"`
 	USB      bool   `json:"usb,omitempty"`
 	Emulator bool   `json:"emulator,omitempty"`
 }
@@ -83,6 +105,8 @@ type LeaseInfo struct {
 	IdleTTLSec int        `json:"idle_ttl_sec"`
 	Explicit   bool       `json:"explicit"`
 	ExpiresAt  *time.Time `json:"expires_at,omitempty"`
+	ETA        *time.Time `json:"eta,omitempty"`
+	ETANote    string     `json:"eta_note,omitempty"`
 }
 
 type WaiterInfo struct {

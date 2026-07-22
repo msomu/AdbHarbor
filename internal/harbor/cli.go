@@ -1,6 +1,7 @@
 package harbor
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"net"
@@ -34,9 +35,9 @@ func CmdDevices() error {
 			lease = "session cleanup"
 		}
 		if d.Lease != nil {
-			lease = fmt.Sprintf("%s (%s%s)%s", d.Lease.Holder,
+			lease = fmt.Sprintf("%s (%s%s)%s%s", d.Lease.Holder,
 				time.Since(d.Lease.AcquiredAt).Round(time.Second), runningSuffix(d.Lease.Running),
-				youSuffix(d.Lease.Session, me))
+				etaSuffix(d.Lease), youSuffix(d.Lease.Session, me))
 		}
 		queue := "-"
 		if d.Waiting > 0 {
@@ -81,6 +82,78 @@ func sharedIdentityWarning(session, source string) string {
 	return ""
 }
 
+// etaSuffix renders a lease's advertised finish time, if it advertised one.
+func etaSuffix(l *LeaseInfo) string {
+	if l == nil || l.ETA == nil {
+		return ""
+	}
+	if d := ETADesc(*l.ETA, l.ETANote, time.Now()); d != "" {
+		return " " + d
+	}
+	return ""
+}
+
+// splitLeadingArg peels off a leading positional argument so flags placed
+// after it are still parsed. Go's flag package stops at the first
+// positional, which would make the natural `eta 25m -note "..."` silently
+// drop the note — an estimate updated without its reason is worse than one
+// that errors.
+func splitLeadingArg(args []string) (first string, rest []string) {
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		return args[0], args[1:]
+	}
+	return "", args
+}
+
+// CmdETA sets how long the caller expects to keep the device it holds.
+// Advisory: it changes nothing about when the lease ends, it only tells
+// whoever is queued behind it what to expect.
+func CmdETA(args []string) error {
+	fs := flag.NewFlagSet("eta", flag.ContinueOnError)
+	serial := fs.String("s", "", "device serial (default: whichever device you hold)")
+	note := fs.String("note", "", "what you are doing, shown to whoever is waiting")
+	clear := fs.Bool("clear", false, "withdraw the estimate")
+	durArg, rest := splitLeadingArg(args)
+	if err := fs.Parse(rest); err != nil {
+		return err
+	}
+	if durArg == "" {
+		durArg = fs.Arg(0)
+	}
+	req := ETAReq{Serial: *serial, Note: *note, Clear: *clear}
+	if !*clear {
+		if durArg == "" {
+			return errors.New("usage: adbharbor eta DURATION [-note \"...\"] | adbharbor eta --clear")
+		}
+		d, err := time.ParseDuration(durArg)
+		if err != nil {
+			return fmt.Errorf("bad duration %q: %w", durArg, err)
+		}
+		if d <= 0 {
+			return errors.New("estimate must be positive; use --clear to withdraw one")
+		}
+		req.ETASec = int(d.Seconds())
+	}
+	if err := EnsureDaemon(); err != nil {
+		return err
+	}
+	req.Session = DetectSession(LoadConfig())
+	resp, err := SetETA(req)
+	if err != nil {
+		return err
+	}
+	if !resp.OK {
+		return errors.New(resp.Message)
+	}
+	if *clear {
+		fmt.Printf("withdrew the estimate on %s\n", resp.Serial)
+		return nil
+	}
+	fmt.Printf("%s: telling waiters you expect to be done in %s\n",
+		resp.Serial, time.Duration(req.ETASec)*time.Second)
+	return nil
+}
+
 // youSuffix marks the rows belonging to the caller. Without it a session
 // reading this output cannot tell its own lease from a stranger's, and an
 // agent blocked behind what is actually its own lingering lease has no way
@@ -112,6 +185,9 @@ func CmdStatus() error {
 		} else {
 			fmt.Printf("  idle-ttl=%ds", l.IdleTTLSec)
 		}
+		if eta := etaSuffix(&l); eta != "" {
+			fmt.Print(" ", strings.TrimSpace(eta))
+		}
 		fmt.Println(youSuffix(l.Session, me))
 		for i, wt := range st.Queues[l.Serial] {
 			fmt.Printf("    queue[%d]: %s (waiting %s)%s\n", i+1, wt.Holder,
@@ -139,8 +215,9 @@ func CmdWhoami() error {
 	held := []string{}
 	for _, l := range st.Leases {
 		if l.Session == session {
-			held = append(held, fmt.Sprintf("%s (%s%s)", l.Serial,
-				time.Since(l.AcquiredAt).Round(time.Second), runningSuffix(l.Running)))
+			held = append(held, fmt.Sprintf("%s (%s%s)%s", l.Serial,
+				time.Since(l.AcquiredAt).Round(time.Second), runningSuffix(l.Running),
+				etaSuffix(&l)))
 		}
 	}
 	fmt.Printf("holding  %s\n", orDash(strings.Join(held, ", ")))
@@ -185,8 +262,8 @@ func CmdWho(args []string) error {
 			if l.Session == me {
 				holder = "you, " + holder
 			}
-			fmt.Printf("%s is held by %s (session %s) since %s, %d command(s) running\n",
-				serial, holder, l.Session, l.AcquiredAt.Format(time.Kitchen), l.Running)
+			fmt.Printf("%s is held by %s (session %s) since %s, %d command(s) running%s\n",
+				serial, holder, l.Session, l.AcquiredAt.Format(time.Kitchen), l.Running, etaSuffix(&l))
 			for i, wt := range st.Queues[serial] {
 				fmt.Printf("  queue[%d]: %s%s\n", i+1, wt.Holder, youSuffix(wt.Session, me))
 			}
@@ -204,12 +281,14 @@ func CmdAcquire(args []string) error {
 	usb := fs.Bool("usb", false, "with --any: only USB devices")
 	emulator := fs.Bool("emulator", false, "with --any: only emulators")
 	ttl := fs.Duration("ttl", 0, "how long to hold the lease (default from config)")
+	eta := fs.Duration("eta", 0, "how long you expect to need it — advisory, shown to waiters")
+	note := fs.String("note", "", "what you are doing, shown to whoever is waiting")
 	sessionFlag := fs.String("session", "", "session key (default: auto-detected)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if *any {
-		return cmdAcquireAny(*usb, *emulator, *ttl, *sessionFlag)
+		return cmdAcquireAny(*usb, *emulator, *ttl, *eta, *note, *sessionFlag)
 	}
 	if *serial == "" {
 		return fmt.Errorf("acquire: -s SERIAL or --any is required")
@@ -223,11 +302,13 @@ func CmdAcquire(args []string) error {
 		session = DetectSession(cfg)
 	}
 	req := AcquireReq{
-		Serial:  *serial,
-		Session: session,
-		Holder:  HolderDesc(session),
-		PID:     os.Getpid(),
-		TTLSec:  int(ttl.Seconds()),
+		Serial:   *serial,
+		Session:  session,
+		Holder:   HolderDesc(session),
+		PID:      os.Getpid(),
+		TTLSec:   int(ttl.Seconds()),
+		ETASec:   int(eta.Seconds()),
+		ETANote:  *note,
 		Explicit: true,
 	}
 	leaseID, err := AcquireBlocking(req, envInt("ADB_HARBOR_WAIT", cfg.WaitSec), func(msg string) {
@@ -250,7 +331,7 @@ func CmdAcquire(args []string) error {
 // ONLY thing printed to stdout, so scripts and agents can do:
 //
 //	S=$(adbharbor acquire --any) && adb -s "$S" ...
-func cmdAcquireAny(usb, emulator bool, ttl time.Duration, sessionFlag string) error {
+func cmdAcquireAny(usb, emulator bool, ttl, eta time.Duration, note, sessionFlag string) error {
 	if err := EnsureDaemon(); err != nil {
 		return err
 	}
@@ -260,11 +341,13 @@ func cmdAcquireAny(usb, emulator bool, ttl time.Duration, sessionFlag string) er
 		session = DetectSession(cfg)
 	}
 	resp, err := AcquireAny(AcquireAnyReq{
-		Session: session,
-		Holder:  HolderDesc(session),
-		PID:     os.Getpid(),
-		TTLSec:  int(ttl.Seconds()),
-		USB:     usb,
+		Session:  session,
+		Holder:   HolderDesc(session),
+		PID:      os.Getpid(),
+		TTLSec:   int(ttl.Seconds()),
+		ETASec:   int(eta.Seconds()),
+		ETANote:  note,
+		USB:      usb,
 		Emulator: emulator,
 	})
 	if err != nil {

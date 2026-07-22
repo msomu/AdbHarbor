@@ -50,6 +50,8 @@ adbharbor devices              # devices + who holds them + queue depth
 adbharbor status               # all leases and queues
 adbharbor who -s SERIAL        # who holds one device
 adbharbor whoami               # your session key, your leases, your queue spots
+adbharbor eta 10m -note "..."  # tell waiters when you expect to be done
+adbharbor eta --clear          # withdraw the estimate
 adbharbor acquire -s SERIAL --ttl 30m   # hold a device explicitly
 adbharbor acquire --any [--usb|--emulator] --ttl 20m
                                # lease ANY free device — prints its serial on
@@ -81,7 +83,7 @@ The snapshot-diff design means it catches every install mechanism (`adb install`
 | Broker unreachable / broken | Warns and runs unlocked (fail-open); clients spawn a classic server |
 | Command can't be tied to one device | Passes through untouched |
 
-Environment overrides: `ADB_HARBOR_SESSION` (explicit session key), `ADB_HARBOR_IDLE` (lease linger seconds), `ADB_HARBOR_WAIT` (max queue wait seconds), `ADB_HARBOR_ADB` (real adb path), `ADB_HARBOR_OFF=1` (bypass locking).
+Environment overrides: `ADB_HARBOR_SESSION` (explicit session key), `ADB_HARBOR_ETA` / `ADB_HARBOR_NOTE` (advertise an expected finish time on an ordinary adb command), `ADB_HARBOR_IDLE` (lease linger seconds), `ADB_HARBOR_WAIT` (max queue wait seconds), `ADB_HARBOR_ADB` (real adb path), `ADB_HARBOR_OFF=1` (bypass locking).
 
 Config lives in `~/.adbharbor/config.json` (idle TTL, wait timeout, agent process names for session detection). Lease events append to `~/.adbharbor/history.jsonl`; daemon logs to `~/.adbharbor/daemon.log`.
 
