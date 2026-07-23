@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 )
 
-const Version = "0.6.2"
+const Version = "0.6.3"
 
 // Dir is the harbor data directory (config, socket, state, logs, shim bin).
 func Dir() string {

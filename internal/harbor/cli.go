@@ -88,13 +88,21 @@ func sharedIdentityWarning(session, source string) string {
 	return ""
 }
 
-// etaSuffix renders a lease's advertised finish time, if it advertised one.
+// etaSuffix renders what a waiter should read off a lease: the holder's
+// declared estimate if it gave one, otherwise an inferred hint from its
+// history — never both, and the inferred form is worded as a guess so the
+// two are never confused.
 func etaSuffix(l *LeaseInfo) string {
-	if l == nil || l.ETA == nil {
+	if l == nil {
 		return ""
 	}
-	if d := ETADesc(*l.ETA, l.ETANote, time.Now()); d != "" {
-		return " " + d
+	if l.ETA != nil {
+		if d := ETADesc(*l.ETA, l.ETANote, time.Now()); d != "" {
+			return " " + d
+		}
+	}
+	if hint := inferredDesc(time.Duration(l.InferredHoldSec) * time.Second); hint != "" {
+		return " " + hint
 	}
 	return ""
 }

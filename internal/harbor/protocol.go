@@ -112,6 +112,10 @@ type LeaseInfo struct {
 	ExpiresAt  *time.Time `json:"expires_at,omitempty"`
 	ETA        *time.Time `json:"eta,omitempty"`
 	ETANote    string     `json:"eta_note,omitempty"`
+	// InferredHoldSec is a guess at this session's typical total hold,
+	// from its own history. Advisory and distinct from a declared ETA: the
+	// display shows it only when ETA is absent, and worded as a guess.
+	InferredHoldSec int `json:"inferred_hold_sec,omitempty"`
 }
 
 type WaiterInfo struct {

@@ -3,6 +3,7 @@ package harbor
 import (
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -495,5 +496,121 @@ func TestSharedIdentityWarning(t *testing.T) {
 	// An explicit key is deliberate, whatever it is named after.
 	if w := sharedIdentityWarning("node-1", "ADB_HARBOR_SESSION"); w != "" {
 		t.Errorf("explicit key warned: %q", w)
+	}
+}
+
+// The inference contract, at the broker level: a declared estimate always
+// wins, an inferred one only fills the gap, and inference never hardens into
+// the promise a holder never made.
+
+// A holder that declared nothing gets an inferred hint once its session has
+// enough history — and it is shown as a guess, in the busy string a blocked
+// agent reads.
+func TestInferredHintFillsTheGap(t *testing.T) {
+	b := testBroker(t, DefaultConfig())
+	b.holds = map[string][]time.Duration{
+		"agent-a": {2 * time.Minute, 4 * time.Minute, 3 * time.Minute},
+	}
+	req := command("agent-a") // no ETASec: declares nothing
+	b.mu.Lock()
+	b.grantLocked(req, time.Unix(1700000000, 0), 30*time.Second)
+	desc := b.serialDescLocked(dev)
+	info := b.leaseInfoLocked(b.leases[dev])
+	b.mu.Unlock()
+
+	if !strings.Contains(desc, "usually ~3m") {
+		t.Errorf("busy string %q carries no inferred hint", desc)
+	}
+	if info.InferredHoldSec != 180 {
+		t.Errorf("InferredHoldSec = %d, want 180", info.InferredHoldSec)
+	}
+	if info.ETA != nil {
+		t.Error("an inferred hint must not populate the declared ETA field")
+	}
+}
+
+// A declared estimate suppresses the inferred one entirely: the holder's own
+// word wins, and the guess never appears alongside it.
+func TestDeclaredETASuppressesInference(t *testing.T) {
+	b := testBroker(t, DefaultConfig())
+	b.holds = map[string][]time.Duration{
+		"agent-a": {2 * time.Minute, 4 * time.Minute, 3 * time.Minute},
+	}
+	req := command("agent-a")
+	req.ETASec, req.ETANote = 600, "maestro smoke"
+	b.mu.Lock()
+	b.grantLocked(req, time.Unix(1700000000, 0), 30*time.Second)
+	desc := b.serialDescLocked(dev)
+	info := b.leaseInfoLocked(b.leases[dev])
+	b.mu.Unlock()
+
+	if strings.Contains(desc, "usually") {
+		t.Errorf("declared ETA should have suppressed the guess: %q", desc)
+	}
+	if !strings.Contains(desc, "maestro smoke") {
+		t.Errorf("declared ETA missing from %q", desc)
+	}
+	if info.InferredHoldSec != 0 {
+		t.Errorf("InferredHoldSec = %d, want 0 when an ETA was declared", info.InferredHoldSec)
+	}
+}
+
+// Too little history means no guess at all — better silent than confidently
+// wrong.
+func TestNoInferenceBelowThreshold(t *testing.T) {
+	b := testBroker(t, DefaultConfig())
+	b.holds = map[string][]time.Duration{"agent-a": {3 * time.Minute, 3 * time.Minute}}
+	b.mu.Lock()
+	b.grantLocked(command("agent-a"), time.Unix(1700000000, 0), 30*time.Second)
+	info := b.leaseInfoLocked(b.leases[dev])
+	desc := b.serialDescLocked(dev)
+	b.mu.Unlock()
+
+	if info.InferredHoldSec != 0 || strings.Contains(desc, "usually") {
+		t.Errorf("inferred from too few samples: sec=%d desc=%q", info.InferredHoldSec, desc)
+	}
+}
+
+// The broker learns from what it observes: releasing a lease feeds that hold
+// back into the session's record, so an estimate emerges without anyone
+// declaring anything.
+func TestBrokerLearnsFromReleases(t *testing.T) {
+	b := testBroker(t, DefaultConfig())
+	t0 := time.Unix(1700000000, 0)
+	for i := 0; i < minHoldSamples; i++ {
+		b.mu.Lock()
+		l := b.grantLocked(command("agent-a"), t0, 30*time.Second)
+		l.Running = 0
+		b.expireLocked(l, t0.Add(2*time.Minute), "idle-released")
+		b.mu.Unlock()
+	}
+	b.mu.Lock()
+	got := b.inferredHoldLocked("agent-a")
+	b.mu.Unlock()
+	if got != 2*time.Minute {
+		t.Errorf("learned typical hold = %v, want 2m from observed releases", got)
+	}
+}
+
+// An inferred hint is not an expiry. However old the lease and however small
+// the guess, the device stays until the real TTL/idle rules end it — the
+// point of not marrying the inference.
+func TestInferenceNeverEndsALease(t *testing.T) {
+	b := testBroker(t, DefaultConfig())
+	b.holds = map[string][]time.Duration{
+		"agent-a": {time.Second, time.Second, time.Second}, // "usually ~1s"
+	}
+	t0 := time.Unix(1700000000, 0)
+	req := command("agent-a")
+	req.Explicit, req.TTLSec = true, 1800
+	req.OwnerPID = os.Getpid()
+	b.mu.Lock()
+	l := b.grantLocked(req, t0, 30*time.Second)
+	l.Running = 0
+	b.mu.Unlock()
+
+	b.sweep(t0.Add(10 * time.Minute)) // long past the 1s "guess"
+	if b.holderAt() != "agent-a" {
+		t.Error("an inferred estimate must never expire a lease")
 	}
 }

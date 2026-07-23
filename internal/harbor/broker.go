@@ -87,6 +87,12 @@ type Broker struct {
 	queues   map[string][]*Waiter
 	waiters  map[string]*Waiter // by waiter ID
 	cleaning map[string]bool    // serials in post-session cleanup
+	// holds is a rolling record of how long each session's recent leases
+	// were actually held, seeded from history at startup and appended to on
+	// every release. It backs an INFERRED estimate for a holder that
+	// declared none — kept strictly apart from a declared ETA, and only
+	// ever shown as a hint, never enforced.
+	holds    map[string][]time.Duration
 	cfgMTime time.Time
 	seq      int64
 }
@@ -121,6 +127,7 @@ func RunDaemon() error {
 		queues:   map[string][]*Waiter{},
 		waiters:  map[string]*Waiter{},
 		cleaning: map[string]bool{},
+		holds:    loadHoldHistory(),
 	}
 	b.cfg.Store(LoadConfig())
 	if info, err := os.Stat(ConfigPath()); err == nil {
@@ -182,7 +189,13 @@ func leaseDesc(l *Lease) string {
 
 func (b *Broker) serialDescLocked(serial string) string {
 	if l := b.leases[serial]; l != nil {
-		return leaseDesc(l)
+		desc := leaseDesc(l)
+		if l.ETA.IsZero() {
+			if hint := inferredDesc(b.inferredHoldLocked(l.Session)); hint != "" {
+				desc += ", " + hint
+			}
+		}
+		return desc
 	}
 	if b.cleaning[serial] {
 		return "session cleanup"
@@ -672,7 +685,7 @@ func (b *Broker) handleState(w http.ResponseWriter, _ *http.Request) {
 	b.mu.Lock()
 	resp := StateResp{Queues: map[string][]WaiterInfo{}}
 	for _, l := range b.leases {
-		resp.Leases = append(resp.Leases, leaseInfo(l))
+		resp.Leases = append(resp.Leases, b.leaseInfoLocked(l))
 	}
 	for serial, q := range b.queues {
 		for _, wt := range q {
@@ -694,7 +707,7 @@ func (b *Broker) handleDevices(w http.ResponseWriter, _ *http.Request) {
 	for _, d := range devs {
 		di := DeviceInfo{Serial: d.Serial, State: d.State, Model: d.Model}
 		if l := b.leases[d.Serial]; l != nil {
-			info := leaseInfo(l)
+			info := b.leaseInfoLocked(l)
 			di.Lease = &info
 		}
 		di.Waiting = len(b.queues[d.Serial])
@@ -711,7 +724,7 @@ func (b *Broker) handleDevices(w http.ResponseWriter, _ *http.Request) {
 			}
 		}
 		if !found {
-			info := leaseInfo(l)
+			info := b.leaseInfoLocked(l)
 			resp.Devices = append(resp.Devices, DeviceInfo{
 				Serial: serial, State: "disconnected", Lease: &info,
 				Waiting: len(b.queues[serial]),
@@ -720,6 +733,16 @@ func (b *Broker) handleDevices(w http.ResponseWriter, _ *http.Request) {
 	}
 	b.mu.Unlock()
 	writeJSON(w, resp)
+}
+
+func (b *Broker) leaseInfoLocked(l *Lease) LeaseInfo {
+	info := leaseInfo(l)
+	if l.ETA.IsZero() {
+		if d := b.inferredHoldLocked(l.Session); d > 0 {
+			info.InferredHoldSec = int(d.Seconds())
+		}
+	}
+	return info
 }
 
 func leaseInfo(l *Lease) LeaseInfo {
@@ -755,6 +778,28 @@ func applyETA(l *Lease, etaSec int, note string, now time.Time) bool {
 	return true
 }
 
+// recordHoldLocked appends an observed hold to the session's rolling record.
+func (b *Broker) recordHoldLocked(session string, d time.Duration) {
+	if session == "" || d < 0 {
+		return
+	}
+	if b.holds == nil {
+		b.holds = map[string][]time.Duration{}
+	}
+	b.holds[session] = lastN(append(b.holds[session], d), maxHoldSamples)
+}
+
+// inferredHoldLocked is the session's typical hold, or zero when there is not
+// enough history to say. Never mixed with a declared ETA — the caller shows
+// one or the other.
+func (b *Broker) inferredHoldLocked(session string) time.Duration {
+	d, ok := typicalHold(b.holds[session])
+	if !ok {
+		return 0
+	}
+	return d
+}
+
 func (b *Broker) leaseByIDLocked(id string) *Lease {
 	for _, l := range b.leases {
 		if l.ID == id {
@@ -768,6 +813,7 @@ func (b *Broker) leaseByIDLocked(id string) *Lease {
 // via a cleanup pass first when enabled and a baseline exists.
 func (b *Broker) expireLocked(l *Lease, now time.Time, reason string) {
 	delete(b.leases, l.Serial)
+	b.recordHoldLocked(l.Session, now.Sub(l.AcquiredAt))
 	b.hist(reason, l, fmt.Sprintf("held %s", time.Since(l.AcquiredAt).Round(time.Second)))
 	log.Printf("%s %s (was %s)", reason, l.Serial, l.Holder)
 	if b.config().CleanupEnabled && len(l.Baseline) > 0 && !b.cleaning[l.Serial] {
