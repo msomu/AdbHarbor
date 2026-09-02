@@ -45,6 +45,13 @@ type Config struct {
 	CleanupEnabled bool `json:"cleanup_enabled"`
 	// ProtectedPackages are package-name prefixes cleanup never uninstalls.
 	ProtectedPackages []string `json:"protected_package_prefixes"`
+	// DenySerials are devices acquire --any / submit will never pick.
+	// The nest Samsung is listed by default; empty the list to allow it.
+	DenySerials []string `json:"deny_serials"`
+	// MCPPort is the preferred localhost port for /mcp and POST /v1/runs.
+	// 0 means 7437. The daemon walks up if the port is taken and writes
+	// the bound port to mcp.port.
+	MCPPort int `json:"mcp_port"`
 }
 
 func DefaultConfig() *Config {
@@ -69,6 +76,8 @@ func DefaultConfig() *Config {
 		ProtectedPackages: []string{
 			"android", "com.android.", "com.google.", "com.samsung.", "com.sec.",
 		},
+		DenySerials: []string{"RZGL41JKGFT"},
+		MCPPort:     7437,
 	}
 }
 

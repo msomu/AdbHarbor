@@ -117,6 +117,11 @@ func RunDaemon() error {
 			}
 		}()
 	}
+	go func() {
+		if err := serveObserve(); err != nil {
+			log.Printf("observe listener: %v", err)
+		}
+	}()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/ping", b.handlePing)
@@ -237,36 +242,65 @@ func (b *Broker) handleAcquireAny(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	var busy []string
-	for _, d := range devs {
-		if d.State != "device" {
-			continue
-		}
-		isEmu := strings.HasPrefix(d.Serial, "emulator-")
-		if req.USB && (isEmu || !d.USB) {
-			continue
-		}
-		if req.Emulator && !isEmu {
-			continue
-		}
-		if l := b.leases[d.Serial]; l != nil {
-			busy = append(busy, fmt.Sprintf("%s (held by %s)", d.Serial, l.Holder))
-			continue
-		}
-		if b.cleaning[d.Serial] {
-			busy = append(busy, d.Serial+" (session cleanup)")
-			continue
-		}
-		acq.Serial = d.Serial
+	held := map[string]string{}
+	for serial, l := range b.leases {
+		held[serial] = l.Holder
+	}
+	serial, busy, deniedN := selectAcquireAny(devs, held, b.cleaning, b.config().DenySerials, req.USB, req.Emulator)
+	if serial != "" {
+		acq.Serial = serial
 		l := b.grantLocked(acq, now, idle)
-		writeJSON(w, AcquireAnyResp{Granted: true, Serial: d.Serial, LeaseID: l.ID})
+		writeJSON(w, AcquireAnyResp{Granted: true, Serial: serial, LeaseID: l.ID})
 		return
 	}
 	msg := "no matching device connected"
+	if deniedN > 0 && len(busy) == 0 {
+		msg = fmt.Sprintf("no matching device connected (%d denied by config)", deniedN)
+	}
 	if len(busy) > 0 {
 		msg = "all matching devices busy: " + strings.Join(busy, ", ")
 	}
 	writeJSON(w, AcquireAnyResp{Message: msg})
+}
+
+// selectAcquireAny returns the first free matching serial. deniedN counts
+// connected devices skipped by DenySerials (not listed as busy).
+func selectAcquireAny(devs []Device, held map[string]string, cleaning map[string]bool, deny []string, usb, emu bool) (serial string, busy []string, deniedN int) {
+	for _, d := range devs {
+		if d.State != "device" {
+			continue
+		}
+		if deniedSerial(d.Serial, deny) {
+			deniedN++
+			continue
+		}
+		isEmu := strings.HasPrefix(d.Serial, "emulator-")
+		if usb && (isEmu || !d.USB) {
+			continue
+		}
+		if emu && !isEmu {
+			continue
+		}
+		if holder, ok := held[d.Serial]; ok {
+			busy = append(busy, fmt.Sprintf("%s (held by %s)", d.Serial, holder))
+			continue
+		}
+		if cleaning[d.Serial] {
+			busy = append(busy, d.Serial+" (session cleanup)")
+			continue
+		}
+		return d.Serial, busy, deniedN
+	}
+	return "", busy, deniedN
+}
+
+func deniedSerial(serial string, deny []string) bool {
+	for _, s := range deny {
+		if s != "" && s == serial {
+			return true
+		}
+	}
+	return false
 }
 
 // acquireLocked grants (or renews) a lease, or enqueues a waiter when the

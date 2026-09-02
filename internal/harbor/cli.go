@@ -318,6 +318,12 @@ func CmdDoctor() error {
 		fmt.Println("  adb port:    proxy disabled (only PATH-shim commands are brokered)")
 	}
 
+	if addr, err := observeAddr(); err != nil {
+		fmt.Println("  observe:     not listening")
+	} else {
+		fmt.Printf("  observe:     %s /mcp  (bearer in %s)\n", addr, MCPTokenPath())
+	}
+
 	fmt.Println("  session:    ", DetectSession(cfg))
 
 	if real != "" {
