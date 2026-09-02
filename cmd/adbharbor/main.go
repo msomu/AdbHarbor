@@ -29,6 +29,10 @@ Usage:
   adbharbor cleanup [on|off]    Show or toggle uninstall-on-release of
                                 session-installed apps (default: off)
   adbharbor doctor              Check shim, real adb, daemon, session detection
+  adbharbor submit --apk FILE --package PKG --activity ACT
+                                Lease any free device, install, launch, screenshot
+  adbharbor expose [--via cloudflare|ngrok|tailscale]
+                                Tunnel localhost /mcp; print URL + token + Cursor snippet
   adbharbor daemon              Run the broker in the foreground (usually automatic)
   adbharbor stop                Stop the broker daemon
   adbharbor version             Print version
@@ -83,6 +87,10 @@ func main() {
 		err = harbor.CmdCleanup(args[1:])
 	case "doctor":
 		err = harbor.CmdDoctor()
+	case "submit":
+		err = harbor.CmdSubmit(args[1:])
+	case "expose":
+		err = harbor.CmdExpose(args[1:])
 	case "shim":
 		// Debug entry point: run the shim without the argv[0] trick.
 		os.Exit(harbor.RunShim(args[1:]))

@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 )
 
-const Version = "0.4.0"
+const Version = "0.5.0"
 
 // Dir is the harbor data directory (config, socket, state, logs, shim bin).
 func Dir() string {
@@ -27,6 +27,9 @@ func LogPath() string      { return filepath.Join(Dir(), "daemon.log") }
 func HistoryPath() string  { return filepath.Join(Dir(), "history.jsonl") }
 func PIDPath() string      { return filepath.Join(Dir(), "daemon.pid") }
 func LockPath() string     { return filepath.Join(Dir(), "daemon.lock") }
+func MCPTokenPath() string { return filepath.Join(Dir(), "mcp_token") }
+func MCPPortPath() string  { return filepath.Join(Dir(), "mcp.port") }
+func RunsDir() string      { return filepath.Join(Dir(), "runs") }
 
 func EnsureDir() error {
 	return os.MkdirAll(BinDir(), 0o700)

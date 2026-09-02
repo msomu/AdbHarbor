@@ -57,8 +57,38 @@ adbharbor acquire --any [--usb|--emulator] --ttl 20m
 adbharbor release -s SERIAL [--force]
 adbharbor cleanup [on|off]     # uninstall-on-release of session apps (default: off)
 adbharbor doctor               # check shim, real adb, daemon, session detection
+adbharbor submit --apk app.apk --package com.example --activity .MainActivity
+                               # lease any free device, install, launch, screenshot
+adbharbor expose [--via cloudflare|ngrok|tailscale]
+                               # tunnel localhost /mcp; print URL + token + Cursor snippet
 adbharbor stop | daemon | uninstall
 ```
+
+## Local Cursor vs cloud agents
+
+**Local Cursor uses the CLI. No MCP.** The IDE already has a shell and the phone is on this Mac:
+
+```
+Cursor on this Mac  --shell-->  adbharbor CLI / ./verify  --lease-->  phone
+```
+
+`adbharbor acquire --any` then `adb -s …`, or `adbharbor submit`. Harbor still owns `:5037`. Do not talk to the phone around it.
+
+**Cloud agents cannot see USB.** They call observe MCP on this Mac through a tunnel you start:
+
+```
+Cursor Cloud  --https-->  tunnel  -->  harbor /mcp on this Mac  --lease-->  phone
+```
+
+The daemon serves `http://127.0.0.1:7437/mcp` (or the next free port). Bearer token in `~/.adbharbor/mcp_token` — required even on localhost. Tools: `list_runs`, `get_run`, `wait_for_run`, `get_proof` (PNG as an image). Submit is outside MCP: `adbharbor submit` or `POST /v1/runs` (APK + package + launch activity). Harbor picks the serial (`acquire --any`). Agents never pass `-s`.
+
+Inspired by the observe-over-MCP pattern. Implementation is new Go on this daemon.
+
+```bash
+adbharbor expose --via cloudflare
+```
+
+Harbor execs `cloudflared` / `ngrok` / `tailscale` from PATH. Missing binary prints `brew install cloudflared` — we do not download it, vendor it, or import a vendor SDK. Prints the public URL, token, and a Cursor Dashboard paste snippet. Nest named tunnels stay ops, not this command.
 
 ## Session cleanup (opt-in)
 
@@ -82,7 +112,7 @@ The snapshot-diff design means it catches every install mechanism (`adb install`
 
 Environment overrides: `ADB_HARBOR_SESSION` (explicit session key), `ADB_HARBOR_IDLE` (lease linger seconds), `ADB_HARBOR_WAIT` (max queue wait seconds), `ADB_HARBOR_ADB` (real adb path), `ADB_HARBOR_OFF=1` (bypass locking).
 
-Config lives in `~/.adbharbor/config.json` (idle TTL, wait timeout, agent process names for session detection). Lease events append to `~/.adbharbor/history.jsonl`; daemon logs to `~/.adbharbor/daemon.log`.
+Config lives in `~/.adbharbor/config.json` (idle TTL, wait timeout, agent process names, `deny_serials`). Lease events append to `~/.adbharbor/history.jsonl`; daemon logs to `~/.adbharbor/daemon.log`. Proofs land in `~/.adbharbor/runs/<id>/`.
 
 ## Agent integration
 
