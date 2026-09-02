@@ -287,14 +287,23 @@ func CmdSubmit(args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("run %s %s\n", done.ID, done.Status)
-	if done.Serial != "" {
-		fmt.Printf("serial %s\n", done.Serial)
-	}
+	writeSubmitResult(os.Stdout, done)
 	if done.Status != "succeeded" {
 		return fmt.Errorf("%s", done.Error)
 	}
-	fmt.Printf("screenshot %s\n", done.ScreenshotPath())
-	fmt.Printf("logcat %s\n", done.LogcatPath())
 	return nil
+}
+
+// writeSubmitResult prints human lines then a JSON object last so last-line
+// parsers take {"id":"..."} instead of a logcat path.
+func writeSubmitResult(w io.Writer, r *Run) {
+	fmt.Fprintf(w, "run %s %s\n", r.ID, r.Status)
+	if r.Serial != "" {
+		fmt.Fprintf(w, "serial %s\n", r.Serial)
+	}
+	if r.Status == "succeeded" {
+		fmt.Fprintf(w, "screenshot %s\n", r.ScreenshotPath())
+		fmt.Fprintf(w, "logcat %s\n", r.LogcatPath())
+	}
+	fmt.Fprintf(w, "{\"id\":%q}\n", r.ID)
 }
