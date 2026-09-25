@@ -2,6 +2,7 @@ package harbor
 
 import (
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -96,7 +97,7 @@ func TestProxyWaiterDroppedWhenClientDisconnects(t *testing.T) {
 
 	client, server := net.Pipe()
 	defer client.Close()
-	abort, stopWatch := watchClientClose(server)
+	abort, stopWatch, _ := watchClientClose(server)
 	defer stopWatch()
 
 	done := make(chan error, 1)
@@ -131,4 +132,86 @@ func TestProxyWaiterDroppedWhenClientDisconnects(t *testing.T) {
 
 	b.EndLeaseCommand(holder.ID)
 	server.Close()
+}
+
+type countingConn struct {
+	net.Conn
+	active atomic.Int32
+}
+
+func (c *countingConn) Read(p []byte) (int, error) {
+	c.active.Add(1)
+	defer c.active.Add(-1)
+	return c.Conn.Read(p)
+}
+
+func TestWatchClientCloseStopWaitsForReadExit(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+
+	wrapped := &countingConn{Conn: server}
+	_, stopWatch, _ := watchClientClose(wrapped)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if wrapped.active.Load() == 1 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if wrapped.active.Load() != 1 {
+		t.Fatal("watcher did not enter Read on underlying conn")
+	}
+
+	stopDone := make(chan struct{})
+	go func() {
+		stopWatch()
+		close(stopDone)
+	}()
+
+	time.Sleep(30 * time.Millisecond)
+	if wrapped.active.Load() == 1 {
+		select {
+		case <-stopDone:
+			t.Fatal("stop returned while watcher still inside Read")
+		default:
+		}
+	}
+
+	select {
+	case <-stopDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stop did not return")
+	}
+	if wrapped.active.Load() != 0 {
+		t.Fatalf("Read still active after stop: %d", wrapped.active.Load())
+	}
+}
+
+func TestWatchClientCloseBuffersPayloadDuringWait(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+
+	abort, stopWatch, out := watchClientClose(server)
+
+	if _, err := client.Write([]byte{'X'}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	select {
+	case <-abort:
+		t.Fatal("payload during queue should not abort wait")
+	default:
+	}
+
+	stopWatch()
+
+	buf := make([]byte, 1)
+	if _, err := out.Read(buf); err != nil {
+		t.Fatal(err)
+	}
+	if buf[0] != 'X' {
+		t.Fatalf("byte=%q want X", buf[0])
+	}
 }
