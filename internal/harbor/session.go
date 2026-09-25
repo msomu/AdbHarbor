@@ -16,7 +16,8 @@ import (
 // long-lived process, while the shells it spawns per command are ephemeral).
 // The nearest matching ancestor gives "name-pid", which stays stable across
 // every command that agent runs and differs between two agents even of the
-// same kind. Fallback: the immediate parent shell.
+// same kind. Fallback: the nearest durable ancestor (skipping ephemeral adb
+// clients and short-lived shells).
 func DetectSession(cfg *Config) string {
 	s, _ := DetectSessionObserver(cfg)
 	return s
@@ -49,12 +50,39 @@ func classifyPID(pid int, cfg *Config) (session string, observer bool) {
 		}
 		cur = ppid
 	}
-	// No agent ancestor: key on the starting process itself, which is
-	// stable for its lifetime (a shell, a gradle daemon, ...).
-	if name, _, ok := psInfo(pid); ok {
-		return fmt.Sprintf("%s-%d", name, pid), false
+	// No agent ancestor: key on the nearest durable ancestor, skipping
+	// ephemeral adb clients and short-lived shells.
+	cur = pid
+	for depth := 0; depth < 25; depth++ {
+		name, ppid, ok := psInfo(cur)
+		if !ok {
+			break
+		}
+		if isSessionRoot(cur, name) {
+			return fmt.Sprintf("pid-%d", pid), false
+		}
+		if !isEphemeralSessionProc(name) {
+			return fmt.Sprintf("%s-%d", name, cur), false
+		}
+		if ppid <= 0 || ppid == cur {
+			break
+		}
+		cur = ppid
 	}
 	return fmt.Sprintf("pid-%d", pid), false
+}
+
+func isEphemeralSessionProc(name string) bool {
+	switch name {
+	case "adb", "sh", "bash", "zsh":
+		return true
+	default:
+		return false
+	}
+}
+
+func isSessionRoot(pid int, name string) bool {
+	return pid == 1 || name == "launchd"
 }
 
 // DetectSessionObserver is DetectSession plus the observer flag for the
@@ -81,7 +109,13 @@ func HolderDesc(session string) string {
 	return fmt.Sprintf("%s (%s)", session, filepath.Base(wd))
 }
 
+// psInfoHook is set by tests to stub the process tree.
+var psInfoHook func(pid int) (name string, ppid int, ok bool)
+
 func psInfo(pid int) (name string, ppid int, ok bool) {
+	if psInfoHook != nil {
+		return psInfoHook(pid)
+	}
 	out, err := exec.Command("ps", "-o", "ppid=,comm=", "-p", strconv.Itoa(pid)).Output()
 	if err != nil {
 		return "", 0, false

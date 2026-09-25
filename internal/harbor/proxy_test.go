@@ -1,6 +1,10 @@
 package harbor
 
-import "testing"
+import (
+	"net"
+	"testing"
+	"time"
+)
 
 func TestParseTransport(t *testing.T) {
 	cases := []struct {
@@ -71,4 +75,60 @@ func TestEnvWithServerPort(t *testing.T) {
 	if !found {
 		t.Error("new port entry missing")
 	}
+}
+
+func TestProxyWaiterDroppedWhenClientDisconnects(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.WaitSec = 30
+	b := &Broker{
+		leases:   map[string]*Lease{},
+		queues:   map[string][]*Waiter{},
+		waiters:  map[string]*Waiter{},
+		cleaning: map[string]bool{},
+	}
+	b.cfg.Store(cfg)
+
+	now := time.Now()
+	idle := time.Duration(cfg.IdleTTLSec) * time.Second
+	holder := b.grantLocked(AcquireReq{
+		Serial: "DEV1", Session: "holder-a", Holder: "holder-a", Command: true,
+	}, now, idle)
+
+	client, server := net.Pipe()
+	defer client.Close()
+	abort, stopWatch := watchClientClose(server)
+	defer stopWatch()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := b.AcquireLocalBlocking(AcquireReq{
+			Serial: "DEV1", Session: "waiter-b", Holder: "waiter-b", Command: true,
+		}, cfg.WaitSec, abort)
+		done <- err
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	if len(b.waiters) != 1 {
+		t.Fatalf("expected 1 waiter, got %d", len(b.waiters))
+	}
+
+	client.Close()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected error when client disconnects")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("AcquireLocalBlocking did not return after client close")
+	}
+
+	if len(b.waiters) != 0 {
+		t.Fatalf("waiter still queued: %d", len(b.waiters))
+	}
+	if len(b.queues["DEV1"]) != 0 {
+		t.Fatalf("queue not empty: %d", len(b.queues["DEV1"]))
+	}
+
+	b.EndLeaseCommand(holder.ID)
+	server.Close()
 }

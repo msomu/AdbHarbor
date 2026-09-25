@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -174,12 +175,14 @@ func (b *Broker) proxyConn(c net.Conn) {
 			splice(c, up)
 			return
 		}
+		abort, stopWatch := watchClientClose(c)
 		lease, err := b.AcquireLocalBlocking(AcquireReq{
 			Serial:  serial,
 			Session: session,
 			Holder:  fmt.Sprintf("%s (%s)", session, procName),
 			Command: true,
-		}, b.config().WaitSec, nil)
+		}, b.config().WaitSec, abort)
+		stopWatch()
 		if err != nil {
 			log.Printf("proxy: %s denied %s on %s: %v", session, firstLine(svc), serial, err)
 			writeFail(c, fmt.Sprintf("adbharbor: device %s is busy (%v); see `adbharbor who -s %s`", serial, err, serial))
@@ -385,6 +388,40 @@ func firstLine(s string) string {
 		s = s[:80]
 	}
 	return s
+}
+
+// watchClientClose reports when the TCP client goes away while the proxy is
+// blocked waiting for a lease. stop must be called before reading from c again.
+func watchClientClose(c net.Conn) (<-chan struct{}, func()) {
+	abort := make(chan struct{})
+	stop := make(chan struct{})
+	var once sync.Once
+	closeAbort := func() { once.Do(func() { close(abort) }) }
+	go func() {
+		defer closeAbort()
+		var scratch [1]byte
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if err := c.SetReadDeadline(time.Now().Add(200 * time.Millisecond)); err != nil {
+				return
+			}
+			_, err := c.Read(scratch[:])
+			_ = c.SetReadDeadline(time.Time{})
+			if err != nil {
+				if ne, ok := err.(net.Error); ok && ne.Timeout() {
+					continue
+				}
+				return
+			}
+			// Client sent the service request while we were queued.
+			return
+		}
+	}()
+	return abort, func() { close(stop) }
 }
 
 func envWithServerPort(env []string, port int) []string {
