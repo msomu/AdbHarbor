@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -174,12 +175,15 @@ func (b *Broker) proxyConn(c net.Conn) {
 			splice(c, up)
 			return
 		}
+		abort, stopWatch, client := watchClientClose(c)
 		lease, err := b.AcquireLocalBlocking(AcquireReq{
 			Serial:  serial,
 			Session: session,
 			Holder:  fmt.Sprintf("%s (%s)", session, procName),
 			Command: true,
-		}, b.config().WaitSec, nil)
+		}, b.config().WaitSec, abort)
+		stopWatch()
+		c = client
 		if err != nil {
 			log.Printf("proxy: %s denied %s on %s: %v", session, firstLine(svc), serial, err)
 			writeFail(c, fmt.Sprintf("adbharbor: device %s is busy (%v); see `adbharbor who -s %s`", serial, err, serial))
@@ -385,6 +389,114 @@ func firstLine(s string) string {
 		s = s[:80]
 	}
 	return s
+}
+
+// readaheadConn buffers bytes read by the lease-queue watcher so later reads
+// (splice) see the full stream.
+type readaheadConn struct {
+	net.Conn
+	mu     sync.Mutex
+	prefix []byte
+}
+
+func (r *readaheadConn) Read(p []byte) (int, error) {
+	r.mu.Lock()
+	if len(r.prefix) > 0 {
+		n := copy(p, r.prefix)
+		r.prefix = r.prefix[n:]
+		r.mu.Unlock()
+		if n < len(p) {
+			m, err := r.Conn.Read(p[n:])
+			return n + m, err
+		}
+		return n, nil
+	}
+	r.mu.Unlock()
+	return r.Conn.Read(p)
+}
+
+func (r *readaheadConn) appendPrefix(b []byte) {
+	if len(b) == 0 {
+		return
+	}
+	r.mu.Lock()
+	r.prefix = append(r.prefix, b...)
+	r.mu.Unlock()
+}
+
+type clientCloseWatcher struct {
+	conn   *readaheadConn
+	abort  chan struct{}
+	stopCh chan struct{}
+	done   chan struct{}
+}
+
+// watchClientClose reports when the client goes away while the proxy waits for
+// a lease. Incoming bytes are buffered, not discarded. stop waits until the
+// watcher has left Read and cleared the read deadline; use the returned conn
+// for subsequent reads.
+func watchClientClose(c net.Conn) (<-chan struct{}, func(), net.Conn) {
+	ra := &readaheadConn{Conn: c}
+	w := &clientCloseWatcher{
+		conn:   ra,
+		abort:  make(chan struct{}),
+		stopCh: make(chan struct{}),
+		done:   make(chan struct{}),
+	}
+	go w.run()
+	return w.abort, w.stop, ra
+}
+
+func (w *clientCloseWatcher) stop() {
+	close(w.stopCh)
+	_ = w.conn.Conn.SetReadDeadline(time.Now())
+	<-w.done
+	_ = w.conn.Conn.SetReadDeadline(time.Time{})
+}
+
+func (w *clientCloseWatcher) run() {
+	defer close(w.done)
+	var abortOnce sync.Once
+	abort := func() { abortOnce.Do(func() { close(w.abort) }) }
+	buf := make([]byte, 256)
+	for {
+		if w.stopped() {
+			_ = w.conn.Conn.SetReadDeadline(time.Time{})
+			return
+		}
+		if err := w.conn.Conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond)); err != nil {
+			abort()
+			_ = w.conn.Conn.SetReadDeadline(time.Time{})
+			return
+		}
+		n, err := w.conn.Conn.Read(buf)
+		_ = w.conn.Conn.SetReadDeadline(time.Time{})
+		if w.stopped() {
+			if n > 0 {
+				w.conn.appendPrefix(buf[:n])
+			}
+			return
+		}
+		if err != nil {
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				continue
+			}
+			abort()
+			return
+		}
+		if n > 0 {
+			w.conn.appendPrefix(buf[:n])
+		}
+	}
+}
+
+func (w *clientCloseWatcher) stopped() bool {
+	select {
+	case <-w.stopCh:
+		return true
+	default:
+		return false
+	}
 }
 
 func envWithServerPort(env []string, port int) []string {

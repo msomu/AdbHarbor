@@ -1,6 +1,11 @@
 package harbor
 
-import "testing"
+import (
+	"net"
+	"sync/atomic"
+	"testing"
+	"time"
+)
 
 func TestParseTransport(t *testing.T) {
 	cases := []struct {
@@ -70,5 +75,143 @@ func TestEnvWithServerPort(t *testing.T) {
 	}
 	if !found {
 		t.Error("new port entry missing")
+	}
+}
+
+func TestProxyWaiterDroppedWhenClientDisconnects(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.WaitSec = 30
+	b := &Broker{
+		leases:   map[string]*Lease{},
+		queues:   map[string][]*Waiter{},
+		waiters:  map[string]*Waiter{},
+		cleaning: map[string]bool{},
+	}
+	b.cfg.Store(cfg)
+
+	now := time.Now()
+	idle := time.Duration(cfg.IdleTTLSec) * time.Second
+	holder := b.grantLocked(AcquireReq{
+		Serial: "DEV1", Session: "holder-a", Holder: "holder-a", Command: true,
+	}, now, idle)
+
+	client, server := net.Pipe()
+	defer client.Close()
+	abort, stopWatch, _ := watchClientClose(server)
+	defer stopWatch()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := b.AcquireLocalBlocking(AcquireReq{
+			Serial: "DEV1", Session: "waiter-b", Holder: "waiter-b", Command: true,
+		}, cfg.WaitSec, abort)
+		done <- err
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	if len(b.waiters) != 1 {
+		t.Fatalf("expected 1 waiter, got %d", len(b.waiters))
+	}
+
+	client.Close()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected error when client disconnects")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("AcquireLocalBlocking did not return after client close")
+	}
+
+	if len(b.waiters) != 0 {
+		t.Fatalf("waiter still queued: %d", len(b.waiters))
+	}
+	if len(b.queues["DEV1"]) != 0 {
+		t.Fatalf("queue not empty: %d", len(b.queues["DEV1"]))
+	}
+
+	b.EndLeaseCommand(holder.ID)
+	server.Close()
+}
+
+type countingConn struct {
+	net.Conn
+	active atomic.Int32
+}
+
+func (c *countingConn) Read(p []byte) (int, error) {
+	c.active.Add(1)
+	defer c.active.Add(-1)
+	return c.Conn.Read(p)
+}
+
+func TestWatchClientCloseStopWaitsForReadExit(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+
+	wrapped := &countingConn{Conn: server}
+	_, stopWatch, _ := watchClientClose(wrapped)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if wrapped.active.Load() == 1 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if wrapped.active.Load() != 1 {
+		t.Fatal("watcher did not enter Read on underlying conn")
+	}
+
+	stopDone := make(chan struct{})
+	go func() {
+		stopWatch()
+		close(stopDone)
+	}()
+
+	time.Sleep(30 * time.Millisecond)
+	if wrapped.active.Load() == 1 {
+		select {
+		case <-stopDone:
+			t.Fatal("stop returned while watcher still inside Read")
+		default:
+		}
+	}
+
+	select {
+	case <-stopDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stop did not return")
+	}
+	if wrapped.active.Load() != 0 {
+		t.Fatalf("Read still active after stop: %d", wrapped.active.Load())
+	}
+}
+
+func TestWatchClientCloseBuffersPayloadDuringWait(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+
+	abort, stopWatch, out := watchClientClose(server)
+
+	if _, err := client.Write([]byte{'X'}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	select {
+	case <-abort:
+		t.Fatal("payload during queue should not abort wait")
+	default:
+	}
+
+	stopWatch()
+
+	buf := make([]byte, 1)
+	if _, err := out.Read(buf); err != nil {
+		t.Fatal(err)
+	}
+	if buf[0] != 'X' {
+		t.Fatalf("byte=%q want X", buf[0])
 	}
 }
